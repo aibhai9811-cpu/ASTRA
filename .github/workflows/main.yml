@@ -20,15 +20,17 @@ steps:
       distribution: temurin
       java-version: '17'
 
-  - name: Set up Gradle
-    uses: gradle/actions/setup-gradle@v4
+  - name: Set up Android SDK
+    uses: android-actions/setup-android@v3
 
   - name: Build debug APK
-    run: gradle --no-daemon assembleDebug
+    run: |
+      chmod +x gradlew
+      ./gradlew --no-daemon assembleDebug
 
   - name: Upload APK
-    uses: actions/upload-artifact@v4
     if: success()
+    uses: actions/upload-artifact@v4
     with:
       name: ASTRA-debug-APK
       path: app/build/outputs/apk/debug/*.apk
