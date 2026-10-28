@@ -1,35 +1,180 @@
-name: Build ASTRA Android APK
+name: Build ASTRA Debug APK
 
-'on':
-workflow_dispatch:
-push:
-branches:
-- main
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: astra-build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-build:
-runs-on: ubuntu-latest
-steps:
-- name: Checkout repository
-uses: actions/checkout@v4
+  build:
+    name: Build debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
 
-  - name: Set up Java
-    uses: actions/setup-java@v4
-    with:
-      distribution: temurin
-      java-version: '17'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
 
-  - name: Set up Android SDK
-    uses: android-actions/setup-android@v3
+      - name: Verify project structure
+        shell: bash
+        run: |
+          set -uo pipefail
+          fail=0
 
-  - name: Build APK
-    run: |
-      chmod +x gradlew
-      ./gradlew assembleDebug
+          echo "---- Repository root ----"
+          ls -la
+          echo "---- gradle/ ----"
+          ls -la gradle 2>/dev/null || echo "(gradle/ folder not found)"
+          echo "---- app/ ----"
+          ls -la app 2>/dev/null || echo "(app/ folder not found)"
+          echo "-------------------------"
 
-  - name: Upload APK
-    uses: actions/upload-artifact@v4
-    with:
-      name: ASTRA-debug-APK
-      path: app/build/outputs/apk/debug/*.apk
-      if-no-files-found: error
+          if [ ! -f settings.gradle.kts ] && [ ! -f settings.gradle ]; then
+            echo "::error::settings.gradle(.kts) is missing from the repository root."
+            fail=1
+          fi
+
+          if [ ! -f app/build.gradle.kts ] && [ ! -f app/build.gradle ]; then
+            echo "::error::app/build.gradle(.kts) is missing. The :app module cannot be built."
+            fail=1
+          fi
+
+          if [ ! -f build.gradle.kts ] && [ ! -f build.gradle ]; then
+            echo "::warning::No root build.gradle(.kts) found. This works only if plugin versions are declared elsewhere (for example in settings.gradle.kts)."
+          fi
+
+          if [ ! -f app/src/main/AndroidManifest.xml ]; then
+            echo "::error::app/src/main/AndroidManifest.xml is missing."
+            fail=1
+          fi
+
+          if ! find app/src/main -name '*.kt' -print -quit 2>/dev/null | grep -q .; then
+            echo "::error::No Kotlin source files (*.kt) found under app/src/main."
+            fail=1
+          fi
+
+          missing_wrapper=0
+          for f in gradlew gradle/wrapper/gradle-wrapper.properties gradle/wrapper/gradle-wrapper.jar; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Gradle wrapper file missing: $f"
+              missing_wrapper=1
+            fi
+          done
+          if [ "$missing_wrapper" -eq 1 ]; then
+            echo "::error::The Gradle wrapper is incomplete. This workflow will not guess a Gradle version. Add gradlew, gradlew.bat, gradle/wrapper/gradle-wrapper.jar and gradle/wrapper/gradle-wrapper.properties from any Android Studio project (GitHub web: Add file > Upload files), then re-run."
+            fail=1
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Project structure check failed. See the errors above."
+            exit 1
+          fi
+
+          chmod +x gradlew
+
+          echo "---- Gradle distribution ----"
+          grep -E '^distributionUrl' gradle/wrapper/gradle-wrapper.properties || true
+          echo "---- Plugin / AGP hints ----"
+          grep -nE 'com\.android\.(application|library)|^agp|kotlin-android|org\.jetbrains\.kotlin|compose' \
+            build.gradle.kts build.gradle settings.gradle.kts gradle/libs.versions.toml app/build.gradle.kts app/build.gradle 2>/dev/null || true
+          echo "Structure check passed."
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Prepare Android SDK
+        shell: bash
+        run: |
+          set -uo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT" ]; then
+            echo "::error::Android SDK not found on this runner (ANDROID_HOME is empty)."
+            exit 1
+          fi
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(command -v sdkmanager || true)"
+          fi
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager not found in the Android SDK."
+            exit 1
+          fi
+
+          echo "Accepting SDK licenses..."
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+
+          COMPILE_SDK="$(grep -hoE 'compileSdk(Version)?[ =(]+[0-9]+' app/build.gradle.kts app/build.gradle 2>/dev/null | grep -oE '[0-9]+' | head -n1 || true)"
+          if [ -n "$COMPILE_SDK" ]; then
+            echo "Detected compileSdk: $COMPILE_SDK"
+            "$SDKMANAGER" "platform-tools" "platforms;android-${COMPILE_SDK}" > /dev/null || \
+              echo "::warning::Could not pre-install platforms;android-${COMPILE_SDK}. Gradle will try to download it."
+          else
+            echo "::warning::Could not detect compileSdk from app/build.gradle(.kts). Gradle will download what it needs."
+          fi
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --version
+          ./gradlew assembleDebug --stacktrace --console=plain
+
+      - name: Locate APK
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK_DIR="app/build/outputs/apk/debug"
+          if [ ! -d "$APK_DIR" ]; then
+            echo "::error::Build finished but $APK_DIR does not exist. Check the applicationId, build variants or output configuration in app/build.gradle(.kts)."
+            find app/build/outputs -maxdepth 4 2>/dev/null || true
+            exit 1
+          fi
+          APK_FILE="$(find "$APK_DIR" -maxdepth 1 -name '*.apk' | head -n1)"
+          if [ -z "$APK_FILE" ]; then
+            echo "::error::No .apk file found in $APK_DIR."
+            ls -la "$APK_DIR"
+            exit 1
+          fi
+          echo "path=$APK_FILE" >> "$GITHUB_OUTPUT"
+          SIZE="$(du -h "$APK_FILE" | cut -f1)"
+          echo "Built: $APK_FILE ($SIZE)"
+          {
+            echo "### ASTRA debug APK built"
+            echo ""
+            echo "- File: \`$(basename "$APK_FILE")\`"
+            echo "- Size: $SIZE"
+            echo "- Download it from the **Artifacts** section at the bottom of this run page."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ASTRA-debug-APK
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ASTRA-build-reports
+          path: |
+            app/build/reports/
+            build/reports/
+          if-no-files-found: ignore
+          retention-days: 7
