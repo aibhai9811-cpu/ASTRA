@@ -28,7 +28,7 @@ uses: actions/checkout@v4
         chmod +x ./gradlew
         ./gradlew --no-daemon assembleDebug
       else
-        echo "Gradle wrapper gradlew is missing from the repository root."
+        echo "Gradle wrapper gradlew is missing."
         exit 1
       fi
 
