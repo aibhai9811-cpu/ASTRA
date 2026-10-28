@@ -1,2 +1,0 @@
-# ASTRA
-Personal Assistant 
