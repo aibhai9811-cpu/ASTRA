@@ -12,9 +12,15 @@ import java.util.Locale
 object ResearchService {
 
     private val PREFIXES = listOf(
-        "research on", "research about", "research", "analysis of", "analysis on", "analysis",
-        "analyze", "analyse", "tell me about", "what is", "what are", "what's", "who is", "who was",
-        "explain", "define", "find information about", "information about", "search for"
+        "what is meant by", "meaning of", "research on", "research about", "research",
+        "analysis of", "analysis on", "analysis", "analyze", "analyse", "tell me about",
+        "what is", "what are", "what's", "who is", "who was", "explain", "define",
+        "find information about", "information about", "search for"
+    )
+    private val SUFFIXES = listOf(
+        "kya hota hai", "kya hota h", "kya hai", "kya h", "kaun hai", "kon hai", "kaun tha",
+        "ke bare me batao", "ke baare mein batao", "ke bare mein batao", "explain karo",
+        "samjhao", "bataiye", "batao"
     )
 
     suspend fun lookup(rawQuery: String): String = withContext(Dispatchers.IO) {
@@ -25,32 +31,37 @@ object ResearchService {
         try {
             val encoded = URLEncoder.encode(topic, "UTF-8")
             val search = JSONObject(
-                httpGet("https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=$encoded&srlimit=1&format=json")
+                httpGet("https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=$encoded&srlimit=4&format=json")
             )
             val hits = search.getJSONObject("query").getJSONArray("search")
-            if (hits.length() == 0) {
-                return@withContext "I could not find reliable information on $topic. Say search $topic to open a web search."
+            for (i in 0 until hits.length()) {
+                val title = hits.getJSONObject(i).getString("title")
+                val pageName = URLEncoder.encode(title, "UTF-8").replace("+", "%20")
+                val summary = JSONObject(httpGet("https://en.wikipedia.org/api/rest_v1/page/summary/$pageName"))
+                if (summary.optString("type") == "disambiguation") continue
+                val extract = summary.optString("extract", "")
+                if (extract.isBlank()) continue
+                return@withContext shorten(extract) + " Source: Wikipedia, $title."
             }
-            val title = hits.getJSONObject(0).getString("title")
-            val pageName = URLEncoder.encode(title, "UTF-8").replace("+", "%20")
-            val summary = JSONObject(httpGet("https://en.wikipedia.org/api/rest_v1/page/summary/$pageName"))
-            val extract = summary.optString("extract", "")
-            if (extract.isBlank()) {
-                "I found a page called $title but it has no summary."
-            } else {
-                shorten(extract) + " Source: Wikipedia, $title."
-            }
+            "I could not find reliable information on $topic. Say search $topic to open a web search."
         } catch (e: Exception) {
             "I could not reach the research source. Please check your internet connection."
         }
     }
 
     private fun cleanQuery(raw: String): String {
-        var q = raw.trim().trimEnd('?', '.', '!')
-        val lower = q.lowercase(Locale.ROOT)
+        var q = raw.trim().trimEnd('?', '.', '!', ' ')
+        var lower = q.lowercase(Locale.ROOT)
         for (p in PREFIXES) {
             if (lower.startsWith("$p ")) {
                 q = q.substring(p.length).trim()
+                break
+            }
+        }
+        lower = q.lowercase(Locale.ROOT)
+        for (s in SUFFIXES) {
+            if (lower.endsWith(" $s")) {
+                q = q.substring(0, q.length - s.length).trim()
                 break
             }
         }
