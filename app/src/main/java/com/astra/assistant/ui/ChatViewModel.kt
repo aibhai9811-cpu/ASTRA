@@ -19,6 +19,7 @@ import com.astra.assistant.model.PendingAction
 import com.astra.assistant.model.Sender
 import com.astra.assistant.model.UserPreferences
 import com.astra.assistant.network.AstraAiService
+import com.astra.assistant.network.ResearchService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -92,6 +93,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun savePreferences(prefs: UserPreferences) {
         _preferences.value = prefs
+    }
+
+    // Shows a conversation that was handled by the background listening service.
+    fun addExchange(userText: String, reply: String) {
+        addMessage(userText, Sender.USER, MessageSource.USER)
+        addMessage(reply, Sender.ASSISTANT, MessageSource.LOCAL_ROUTER)
     }
 
     // ---- Commands ----
@@ -230,11 +237,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun routeToAi(query: String, speak: (String) -> Unit) {
         val prefs = _preferences.value
         if (prefs.backendServerUrl.isBlank()) {
-            deliver(
-                "No AI backend is configured yet. Local commands still work.",
-                MessageSource.LOCAL_ROUTER,
-                speak
-            )
+            deliver(ResearchService.lookup(query), MessageSource.ONLINE_AI, speak)
             return
         }
         val memoryContext = memoryRepository.getApprovedContextSummary()
