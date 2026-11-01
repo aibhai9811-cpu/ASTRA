@@ -1,14 +1,12 @@
 package com.astra.assistant.commands
 
-import android.app.Activity
-import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.provider.AlarmClock
 import android.provider.MediaStore
 import android.provider.Settings
-import android.util.Log
+import androidx.activity.ComponentActivity
 import com.astra.assistant.model.PendingAction
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -38,7 +36,7 @@ class CommandProcessor(private val context: Context) {
 
         // 1. Back Navigation
         if (lower == "back" || lower == "go back" || lower == "peeche jao") {
-            if (context is Activity) {
+            if (context is ComponentActivity) {
                 context.runOnUiThread { context.onBackPressedDispatcher.onBackPressed() }
             }
             return CommandExecutionResult.Handled("Going back.", "Back Navigation", "NAVIGATE_BACK")
@@ -53,7 +51,7 @@ class CommandProcessor(private val context: Context) {
 
         // 3. YouTube
         if (lower.contains("youtube") || lower.contains("यूट्यूब")) {
-            val queryParam = query.replace("(?i)^(open|launch|search|on)?\s*(youtube|यूट्यूब)\s*".toRegex(), "").trim()
+            val queryParam = query.replace("(?i)^(open|launch|search|on)?\\s*(youtube|यूट्यूब)\\s*".toRegex(), "").trim()
             val intent = if (queryParam.isNotEmpty()) {
                 Intent(Intent.ACTION_SEARCH).apply {
                     setPackage("com.google.android.youtube")
@@ -98,7 +96,7 @@ class CommandProcessor(private val context: Context) {
 
         // 8. Maps & Navigation
         if (lower.contains("maps") || lower.contains("navigate") || lower.contains("रास्ता")) {
-            val dest = query.replace("(?i)^(open|launch|navigate|directions|to)?\s*(maps?)?\s*(to)?\s*".toRegex(), "").trim()
+            val dest = query.replace("(?i)^(open|launch|navigate|directions|to)?\\s*(maps?)?\\s*(to)?\\s*".toRegex(), "").trim()
             val uri = if (dest.isNotEmpty()) Uri.parse("geo:0,0?q=" + Uri.encode(dest)) else Uri.parse("geo:0,0")
             val intent = Intent(Intent.ACTION_VIEW, uri).apply {
                 setPackage("com.google.android.apps.maps")
@@ -110,7 +108,7 @@ class CommandProcessor(private val context: Context) {
 
         // 9. Consequential: Phone call
         if (lower.startsWith("call ") || lower.startsWith("dial ") || lower.contains("फोन लगाओ")) {
-            val target = query.replace("(?i)^(call|dial|फोन लगाओ)\s+".toRegex(), "").trim()
+            val target = query.replace("(?i)^(call|dial|फोन लगाओ)\\s+".toRegex(), "").trim()
             return CommandExecutionResult.RequiresConfirmation(
                 PendingAction("CALL_PHONE", target, "Confirm placing call to '$target'?", "Call $target")
             )
