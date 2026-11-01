@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_description">ASTRA uses this to press Back, Home and Recents and to open apps when you give a voice command.</string>
+</resources>
