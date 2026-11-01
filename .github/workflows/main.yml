@@ -130,7 +130,7 @@ jobs:
         run: |
           set -euo pipefail
           ./gradlew --version
-          ./gradlew assembleDebug --stacktrace --console=plain
+          ./gradlew assembleDebug --console=plain
 
       - name: Locate APK
         id: apk
