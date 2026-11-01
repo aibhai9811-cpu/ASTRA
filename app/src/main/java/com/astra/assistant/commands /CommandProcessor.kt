@@ -28,6 +28,14 @@ class CommandProcessor(private val context: Context) {
         }
 
         val lower = query.lowercase(Locale.ROOT)
+        val greetingKey = lower.trimEnd('.', '!', '?', ' ')
+        val greetings = setOf("hi", "hii", "hello", "hey", "hi astra", "hello astra", "hey astra", "namaste", "namaskar", "नमस्ते")
+        if (greetingKey in greetings) {
+            return CommandExecutionResult.Handled("Hello, sir. ASTRA is online and ready.", "Greeting", "GREETING")
+        }
+        if (greetingKey == "how are you" || greetingKey == "kaise ho") {
+            return CommandExecutionResult.Handled("All systems nominal, sir. How can I help?", "Status", "STATUS")
+        }
 
         // 0. Continuous Listening Stop Command
         if (lower == "stop listening" || lower == "ruk jao" || lower == "so jao") {
