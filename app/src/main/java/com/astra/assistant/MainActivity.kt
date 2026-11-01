@@ -5,44 +5,14 @@ import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.astra.assistant.commands.CommandProcessor
-import com.astra.assistant.model.*
-import com.astra.assistant.ui.*
+import com.astra.assistant.model.AssistantState
+import com.astra.assistant.ui.AstraMainApp
+import com.astra.assistant.ui.ChatViewModel
 import com.astra.assistant.voice.VoiceManager
-import kotlinx.coroutines.launch
 
 enum class AppNavTab {
     ASSISTANT,
@@ -92,6 +62,10 @@ class MainActivity : ComponentActivity() {
                 viewModel.clearPartialTranscript()
                 viewModel.setAssistantState(AssistantState.IDLE)
                 viewModel.setNotice(errorMsg)
+            },
+            onListeningStarted = {
+                viewModel.clearPartialTranscript()
+                viewModel.setAssistantState(AssistantState.LISTENING)
             }
         )
 
@@ -124,6 +98,11 @@ class MainActivity : ComponentActivity() {
         val trimmed = command.trim()
         if (trimmed.isEmpty()) return
 
+        val lower = trimmed.lowercase().trimEnd('.', '!', '?', ' ')
+        if (lower == "stop listening" || lower == "ruk jao" || lower == "so jao") {
+            voiceManager?.continuousMode = false
+        }
+
         Log.i(TAG, "Central executeCommand received: '$trimmed'")
         viewModel.executeCommand(
             command = trimmed,
@@ -145,10 +124,10 @@ class MainActivity : ComponentActivity() {
                     viewModel.setAssistantState(AssistantState.IDLE)
                 }
                 else -> {
-                    viewModel.setAssistantState(AssistantState.LISTENING)
                     viewModel.clearPartialTranscript()
                     voiceManager?.recognitionLanguage = viewModel.preferences.value.recognitionLanguage
                     voiceManager?.preferOnDevice = viewModel.preferences.value.preferOnDeviceRecognition
+                    voiceManager?.continuousMode = true
                     voiceManager?.startListening()
                 }
             }
@@ -162,6 +141,16 @@ class MainActivity : ComponentActivity() {
             voiceManager?.speechRate = viewModel.preferences.value.speechRate
             voiceManager?.speechPitch = viewModel.preferences.value.speechPitch
             voiceManager?.speak(text)
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        if (voiceManager?.continuousMode == true) {
+            voiceManager?.stopListening()
+            viewModel.setAssistantState(AssistantState.IDLE)
+            viewModel.clearPartialTranscript()
+            viewModel.setNotice("Listening paused because ASTRA left the screen.")
         }
     }
 
