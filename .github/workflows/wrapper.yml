@@ -38,6 +38,7 @@ jobs:
           gradle --version
           mkdir -p /tmp/wrapgen
           cd /tmp/wrapgen
+          touch settings.gradle
           gradle wrapper --gradle-version "${{ inputs.gradle_version }}" --distribution-type bin
           ls -la . gradle/wrapper
 
