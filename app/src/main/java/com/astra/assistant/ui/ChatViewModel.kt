@@ -3,6 +3,8 @@ package com.astra.assistant.ui
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.astra.assistant.ai.AiOutcome
+import com.astra.assistant.ai.AstraAi
 import com.astra.assistant.commands.CommandExecutionResult
 import com.astra.assistant.commands.CommandProcessor
 import com.astra.assistant.data.AstraDatabase
@@ -18,7 +20,6 @@ import com.astra.assistant.model.MessageSource
 import com.astra.assistant.model.PendingAction
 import com.astra.assistant.model.Sender
 import com.astra.assistant.model.UserPreferences
-import com.astra.assistant.network.AstraAiService
 import com.astra.assistant.network.ResearchService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -33,7 +34,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val memoryRepository = AstraMemoryRepository(database.memoryDao())
     private val correctionRepository = AstraCorrectionRepository(database.correctionRuleDao())
     private val knowledgeRepository = AstraKnowledgeRepository(database.knowledgeDao())
-    private val aiService = AstraAiService()
+
+    private var shownSetupHint = false
 
     private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
     val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
@@ -148,14 +150,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _pendingAction.value = null
         viewModelScope.launch {
             try {
-                val result = commandProcessor.executeConfirmedAction(action)
+                val result = if (action.actionType == "AI_COMMAND") {
+                    AstraAi.runSuggested(commandProcessor, action.target)
+                } else {
+                    commandProcessor.executeConfirmedAction(action)
+                }
                 if (action.actionType == "CLEAR_HISTORY") {
                     _messages.value = emptyList()
+                    AstraAi.clearHistory()
                 }
                 val text = when (result) {
                     is CommandExecutionResult.Handled -> result.message
                     is CommandExecutionResult.Error -> result.error
-                    is CommandExecutionResult.RequiresConfirmation -> result.pendingAction.prompt
+                    is CommandExecutionResult.RequiresConfirmation -> {
+                        _pendingAction.value = result.pendingAction
+                        result.pendingAction.prompt
+                    }
                     is CommandExecutionResult.RouteToAi -> "Done."
                 }
                 deliver(text, MessageSource.LOCAL_ROUTER, speakCallback)
@@ -235,21 +245,35 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private suspend fun routeToAi(query: String, speak: (String) -> Unit) {
-        val prefs = _preferences.value
-        if (prefs.backendServerUrl.isBlank()) {
-            deliver(ResearchService.lookup(query), MessageSource.ONLINE_AI, speak)
-            return
+        val outcome = AstraAi.ask(getApplication<Application>(), query) {
+            memoryRepository.getApprovedContextSummary()
         }
-        val memoryContext = memoryRepository.getApprovedContextSummary()
-        val response = aiService.queryAiBackend(
-            endpointUrl = prefs.backendServerUrl,
-            userQuery = query,
-            history = _messages.value.takeLast(10),
-            memoryContext = memoryContext,
-            assistantName = prefs.assistantName,
-            language = prefs.recognitionLanguage
-        )
-        deliver(response.replyText, response.sourceType, speak)
+        when (outcome) {
+            is AiOutcome.Reply -> {
+                if (outcome.redactions > 0) {
+                    _notice.value = "Private details were removed before sending to Gemini."
+                }
+                val suggestion = outcome.suggestedCommand
+                if (suggestion != null) {
+                    val label = outcome.actionLabel ?: suggestion
+                    _pendingAction.value = PendingAction("AI_COMMAND", suggestion, "Run: $label?", label)
+                    deliver("${outcome.text} Should I run: $label?", MessageSource.ONLINE_AI, speak)
+                } else {
+                    deliver(outcome.text, MessageSource.ONLINE_AI, speak)
+                }
+            }
+            is AiOutcome.Failure -> deliver(outcome.message, MessageSource.LOCAL_ROUTER, speak)
+            AiOutcome.Busy ->
+                deliver("I am still working on your last question.", MessageSource.LOCAL_ROUTER, speak)
+            AiOutcome.Ignored -> _assistantState.value = AssistantState.IDLE
+            AiOutcome.NotConfigured -> {
+                if (!shownSetupHint) {
+                    shownSetupHint = true
+                    _notice.value = "Gemini is not set up yet. Open Settings to connect it."
+                }
+                deliver(ResearchService.lookup(query), MessageSource.ONLINE_AI, speak)
+            }
+        }
     }
 
     private fun deliver(text: String, source: MessageSource, speak: (String) -> Unit) {
