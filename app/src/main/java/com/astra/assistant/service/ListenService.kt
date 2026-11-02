@@ -15,8 +15,12 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import com.astra.assistant.MainActivity
+import com.astra.assistant.ai.AiOutcome
+import com.astra.assistant.ai.AstraAi
 import com.astra.assistant.commands.CommandExecutionResult
 import com.astra.assistant.commands.CommandProcessor
+import com.astra.assistant.data.AstraDatabase
+import com.astra.assistant.data.repository.AstraMemoryRepository
 import com.astra.assistant.model.AssistantState
 import com.astra.assistant.model.PendingAction
 import com.astra.assistant.network.ResearchService
@@ -33,11 +37,13 @@ class ListenService : Service() {
 
     private var voice: VoiceManager? = null
     private var processor: CommandProcessor? = null
+    private var memoryRepository: AstraMemoryRepository? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var wakeLock: PowerManager.WakeLock? = null
     private var pending: PendingAction? = null
     private var pendingExpiresAt = 0L
     private var followUpUntil = 0L
+    private var shownSetupHint = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -45,6 +51,10 @@ class ListenService : Service() {
         if (intent?.action == ACTION_STOP) {
             stopSelf()
             return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_HUSH) {
+            voice?.stopSpeaking()
+            return START_STICKY
         }
         if (!enterForeground()) {
             AssistantBridge.notices.tryEmit("Could not start background listening. Open ASTRA and tap the mic again.")
@@ -73,12 +83,24 @@ class ListenService : Service() {
             Intent(this, ListenService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
+        val hushIntent = PendingIntent.getService(
+            this, 2,
+            Intent(this, ListenService::class.java).setAction(ACTION_HUSH),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
         val notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("ASTRA is listening")
             .setContentText("Say \"ASTRA\" and then your command")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(openIntent)
             .setOngoing(true)
+            .addAction(
+                Notification.Action.Builder(
+                    Icon.createWithResource(this, android.R.drawable.ic_lock_silent_mode),
+                    "Hush",
+                    hushIntent
+                ).build()
+            )
             .addAction(
                 Notification.Action.Builder(
                     Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
@@ -102,6 +124,7 @@ class ListenService : Service() {
 
     private fun setUp() {
         processor = CommandProcessor(applicationContext)
+        memoryRepository = AstraMemoryRepository(AstraDatabase.getDatabase(applicationContext, scope).memoryDao())
         val power = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "astra:listen").apply {
             setReferenceCounted(false)
@@ -131,16 +154,25 @@ class ListenService : Service() {
         if (text.isEmpty()) return
         val now = SystemClock.elapsedRealtime()
 
-        // 1. Waiting for a yes/no (call or text message)
+        // 1. Waiting for a yes/no (call, text message or a Gemini suggestion)
         val waiting = pending
         if (waiting != null) {
             pending = null
             if (now <= pendingExpiresAt) {
                 val answer = text.lowercase(Locale.ROOT).trimEnd('.', '!', '?', ' ')
                 if (answer in YES_WORDS) {
+                    val engine = processor
+                    if (engine == null) {
+                        reply(text, "ASTRA is not ready yet.")
+                        return
+                    }
                     scope.launch {
-                        val result = processor?.executeConfirmedAction(waiting)
-                        reply(text, resultText(result))
+                        val result = if (waiting.actionType == "AI_COMMAND") {
+                            AstraAi.runSuggested(engine, waiting.target)
+                        } else {
+                            engine.executeConfirmedAction(waiting)
+                        }
+                        presentResult(text, result)
                     }
                     return
                 }
@@ -160,7 +192,7 @@ class ListenService : Service() {
             } else {
                 command = stripped
                 if (command.isEmpty()) {
-                    followUpUntil = now + 8000
+                    followUpUntil = now + FOLLOW_UP_MS
                     reply(text, "Yes, sir?")
                     return
                 }
@@ -177,23 +209,10 @@ class ListenService : Service() {
         scope.launch {
             try {
                 val result = processor?.processCommand(command)
-                when (result) {
-                    is CommandExecutionResult.Handled -> {
-                        reply(command, result.message)
-                        if (result.actionType == "STOP_LISTENING") {
-                            voice?.continuousMode = false
-                            delay(2500)
-                            stopSelf()
-                        }
-                    }
-                    is CommandExecutionResult.RequiresConfirmation -> {
-                        pending = result.pendingAction
-                        pendingExpiresAt = SystemClock.elapsedRealtime() + 20000
-                        reply(command, result.pendingAction.prompt + " Say yes or no.")
-                    }
-                    is CommandExecutionResult.RouteToAi -> reply(command, ResearchService.lookup(result.query))
-                    is CommandExecutionResult.Error -> reply(command, result.error)
-                    null -> reply(command, "ASTRA is not ready yet.")
+                if (result is CommandExecutionResult.RouteToAi) {
+                    askAi(command, result.query)
+                } else {
+                    presentResult(command, result)
                 }
             } catch (e: Exception) {
                 reply(command, "Something went wrong: ${e.message ?: "unknown error"}")
@@ -201,12 +220,55 @@ class ListenService : Service() {
         }
     }
 
-    private fun resultText(result: CommandExecutionResult?): String = when (result) {
-        is CommandExecutionResult.Handled -> result.message
-        is CommandExecutionResult.Error -> result.error
-        is CommandExecutionResult.RequiresConfirmation -> result.pendingAction.prompt
-        is CommandExecutionResult.RouteToAi -> "Done."
-        null -> "Done."
+    private suspend fun presentResult(userText: String, result: CommandExecutionResult?) {
+        when (result) {
+            is CommandExecutionResult.Handled -> {
+                reply(userText, result.message)
+                if (result.actionType == "STOP_LISTENING") {
+                    voice?.continuousMode = false
+                    delay(2500)
+                    stopSelf()
+                }
+            }
+            is CommandExecutionResult.RequiresConfirmation -> {
+                pending = result.pendingAction
+                pendingExpiresAt = SystemClock.elapsedRealtime() + 20000
+                reply(userText, result.pendingAction.prompt + " Say yes or no.")
+            }
+            is CommandExecutionResult.Error -> reply(userText, result.error)
+            is CommandExecutionResult.RouteToAi -> reply(userText, "Done.")
+            null -> reply(userText, "ASTRA is not ready yet.")
+        }
+    }
+
+    private suspend fun askAi(spoken: String, query: String) {
+        val outcome = AstraAi.ask(applicationContext, query) {
+            memoryRepository?.getApprovedContextSummary().orEmpty()
+        }
+        when (outcome) {
+            is AiOutcome.Reply -> {
+                followUpUntil = SystemClock.elapsedRealtime() + FOLLOW_UP_MS
+                val suggestion = outcome.suggestedCommand
+                if (suggestion != null) {
+                    val label = outcome.actionLabel ?: suggestion
+                    pending = PendingAction("AI_COMMAND", suggestion, "Run: $label?", label)
+                    pendingExpiresAt = SystemClock.elapsedRealtime() + 20000
+                    reply(spoken, "${outcome.text} Should I run: $label? Say yes or no.")
+                } else {
+                    reply(spoken, outcome.text)
+                }
+            }
+            is AiOutcome.Failure -> reply(spoken, outcome.message)
+            AiOutcome.Busy -> reply(spoken, "I am still working on your last question.")
+            AiOutcome.Ignored -> AssistantBridge.phase.value = AssistantState.LISTENING
+            AiOutcome.NotConfigured -> {
+                if (!shownSetupHint) {
+                    shownSetupHint = true
+                    AssistantBridge.notices.tryEmit("Gemini is not set up yet. Open Settings to connect it.")
+                }
+                reply(spoken, ResearchService.lookup(query))
+            }
+        }
     }
 
     private fun reply(userText: String, text: String) {
@@ -230,6 +292,8 @@ class ListenService : Service() {
         private const val CHANNEL_ID = "astra_listen"
         private const val NOTIFICATION_ID = 4711
         private const val ACTION_STOP = "com.astra.assistant.STOP_LISTENING"
+        private const val ACTION_HUSH = "com.astra.assistant.HUSH"
+        private const val FOLLOW_UP_MS = 25000L
 
         private val YES_WORDS = setOf(
             "yes", "yeah", "yep", "confirm", "ok", "okay", "sure", "go ahead", "do it",
@@ -245,6 +309,12 @@ class ListenService : Service() {
 
         fun stop(context: Context) {
             context.stopService(Intent(context, ListenService::class.java))
+        }
+
+        fun hush(context: Context) {
+            if (AssistantBridge.active.value) {
+                context.startService(Intent(context, ListenService::class.java).setAction(ACTION_HUSH))
+            }
         }
     }
 }
