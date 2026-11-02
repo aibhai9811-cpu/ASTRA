@@ -120,6 +120,15 @@ class MainActivity : ComponentActivity() {
     private fun hasPermission(permission: String): Boolean =
         ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
 
+    if (viewModel.assistantState.value == AssistantState.SPEAKING) {
+            voiceManager?.stopSpeaking()
+            ListenService.hush(this)
+            viewModel.setAssistantState(
+                if (AssistantBridge.active.value) AssistantState.LISTENING else AssistantState.IDLE
+            )
+            return
+    }
+    
     private fun onMicToggle() {
         if (AssistantBridge.active.value) {
             ListenService.stop(this)
