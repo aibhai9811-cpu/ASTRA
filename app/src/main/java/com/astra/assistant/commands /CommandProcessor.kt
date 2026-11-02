@@ -93,6 +93,17 @@ class CommandProcessor(private val context: Context) {
             return CommandExecutionResult.Handled("The current time is $formatted, sir.", "Time Query", "GET_TIME")
         }
 
+        // Open-ended questions and follow-ups go to the AI brain
+        val aiStarts = listOf(
+            "how ", "why ", "which ", "describe ", "compare ", "summarize ", "summarise ", "translate ",
+            "teach me ", "suggest ", "recommend ", "difference between ", "can you explain", "could you explain",
+            "help me understand", "give me an example", "give an example", "in hindi", "in english", "in hinglish",
+            "explain it", "explain this", "when did ", "when was ", "samjhao", "isko explain"
+        )
+        if (aiStarts.any { lower.startsWith(it) }) {
+            return CommandExecutionResult.RouteToAi(query)
+        }
+        
         // Research and information questions
         if (RESEARCH_PREFIXES.any { lower == it || lower.startsWith("$it ") } ||
             RESEARCH_SUFFIXES.any { key.endsWith(" $it") }
