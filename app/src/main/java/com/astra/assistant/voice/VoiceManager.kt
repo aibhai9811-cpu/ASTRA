@@ -211,6 +211,8 @@ class VoiceManager(
         isSpeakingNow = true
         mainHandler.removeCallbacks(restartRunnable)
         speechRecognizer?.cancel()
+        val hasDevanagari = text.any { it in '\u0900'..'\u097F' }
+        textToSpeech?.language = if (hasDevanagari) Locale("hi", "IN") else Locale("en", "IN")
         textToSpeech?.setSpeechRate(speechRate)
         textToSpeech?.setPitch(speechPitch)
         textToSpeech?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "ASTRA_TTS")
