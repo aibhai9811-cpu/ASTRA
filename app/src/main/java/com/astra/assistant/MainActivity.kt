@@ -120,16 +120,16 @@ class MainActivity : ComponentActivity() {
     private fun hasPermission(permission: String): Boolean =
         ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
 
-    if (viewModel.assistantState.value == AssistantState.SPEAKING) {
+    private fun onMicToggle() {
+        // Tapping the mic while ASTRA is talking only interrupts the speech.
+        if (viewModel.assistantState.value == AssistantState.SPEAKING) {
             voiceManager?.stopSpeaking()
             ListenService.hush(this)
             viewModel.setAssistantState(
                 if (AssistantBridge.active.value) AssistantState.LISTENING else AssistantState.IDLE
             )
             return
-    }
-    
-    private fun onMicToggle() {
+        }
         if (AssistantBridge.active.value) {
             ListenService.stop(this)
             return
