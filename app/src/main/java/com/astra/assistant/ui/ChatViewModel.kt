@@ -21,6 +21,7 @@ import com.astra.assistant.model.PendingAction
 import com.astra.assistant.model.Sender
 import com.astra.assistant.model.UserPreferences
 import com.astra.assistant.network.ResearchService
+import com.astra.assistant.service.ConfirmationManager
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -52,8 +53,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _notice = MutableStateFlow<String?>(null)
     val notice: StateFlow<String?> = _notice.asStateFlow()
 
-    private val _pendingAction = MutableStateFlow<PendingAction?>(null)
-    val pendingAction: StateFlow<PendingAction?> = _pendingAction.asStateFlow()
+    // Shared with the background service, so a confirmation is never in two places.
+    val pendingAction: StateFlow<PendingAction?> = ConfirmationManager.pendingFlow
 
     private val _preferences = MutableStateFlow(UserPreferences())
     val preferences: StateFlow<UserPreferences> = _preferences.asStateFlow()
@@ -110,6 +111,28 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         commandProcessor: CommandProcessor,
         speakCallback: (String) -> Unit
     ) {
+        // Confirmation has the highest priority and never reaches Gemini.
+        val waiting = ConfirmationManager.peek()
+        if (waiting != null) {
+            when (ConfirmationManager.interpret(command)) {
+                ConfirmationManager.Answer.YES -> {
+                    addMessage(command, Sender.USER, MessageSource.USER)
+                    confirmPendingAction(commandProcessor, speakCallback)
+                    return
+                }
+                ConfirmationManager.Answer.NO -> {
+                    addMessage(command, Sender.USER, MessageSource.USER)
+                    cancelPendingAction(speakCallback)
+                    return
+                }
+                ConfirmationManager.Answer.UNCLEAR -> ConfirmationManager.clear()
+            }
+        } else if (ConfirmationManager.isBareAnswer(command) && !AstraAi.hasRecentConversation()) {
+            addMessage(command, Sender.USER, MessageSource.USER)
+            deliver("There is nothing waiting for confirmation.", MessageSource.LOCAL_ROUTER, speakCallback)
+            return
+        }
+
         addMessage(command, Sender.USER, MessageSource.USER)
         _assistantState.value = AssistantState.PROCESSING
         _partialTranscript.value = ""
@@ -146,8 +169,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         commandProcessor: CommandProcessor,
         speakCallback: (String) -> Unit
     ) {
-        val action = _pendingAction.value ?: return
-        _pendingAction.value = null
+        val action = ConfirmationManager.take() ?: return
         viewModelScope.launch {
             try {
                 val result = if (action.actionType == "AI_COMMAND") {
@@ -163,7 +185,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     is CommandExecutionResult.Handled -> result.message
                     is CommandExecutionResult.Error -> result.error
                     is CommandExecutionResult.RequiresConfirmation -> {
-                        _pendingAction.value = result.pendingAction
+                        ConfirmationManager.set(result.pendingAction)
                         result.pendingAction.prompt
                     }
                     is CommandExecutionResult.RouteToAi -> "Done."
@@ -180,8 +202,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun cancelPendingAction(speakCallback: (String) -> Unit) {
-        _pendingAction.value = null
-        deliver("Action cancelled.", MessageSource.LOCAL_ROUTER, speakCallback)
+        ConfirmationManager.clear()
+        deliver("Cancelled.", MessageSource.LOCAL_ROUTER, speakCallback)
     }
 
     // ---- Memory, corrections, knowledge ----
@@ -235,7 +257,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             is CommandExecutionResult.Handled ->
                 deliver(result.message, MessageSource.LOCAL_ROUTER, speak)
             is CommandExecutionResult.RequiresConfirmation -> {
-                _pendingAction.value = result.pendingAction
+                ConfirmationManager.set(result.pendingAction)
                 deliver(result.pendingAction.prompt, MessageSource.LOCAL_ROUTER, speak)
             }
             is CommandExecutionResult.RouteToAi -> routeToAi(result.query, speak)
@@ -256,6 +278,40 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val suggestion = outcome.suggestedCommand
                 if (suggestion != null) {
                     val label = outcome.actionLabel ?: suggestion
+                    ConfirmationManager.set(PendingAction("AI_COMMAND", suggestion, "Run: $label?", label))
+                    deliver("${outcome.text} Should I run: $label?", MessageSource.ONLINE_AI, speak)
+                } else {
+                    deliver(outcome.text, MessageSource.ONLINE_AI, speak)
+                }
+            }
+            is AiOutcome.Failure -> deliver(outcome.message, MessageSource.LOCAL_ROUTER, speak)
+            AiOutcome.Busy ->
+                deliver("The AI is still working on earlier questions. Please try again in a moment.", MessageSource.LOCAL_ROUTER, speak)
+            AiOutcome.Ignored -> _assistantState.value = AssistantState.IDLE
+            AiOutcome.NotConfigured -> {
+                if (!shownSetupHint) {
+                    shownSetupHint = true
+                    _notice.value = "Gemini is not set up yet. Open Settings to connect it."
+                }
+                deliver(ResearchService.lookup(query), MessageSource.ONLINE_AI, speak)
+            }
+        }
+    }
+
+    private fun deliver(text: String, source: MessageSource, speak: (String) -> Unit) {
+        addMessage(text, Sender.ASSISTANT, source)
+        _assistantState.value = if (_preferences.value.autoSpeakResponses) {
+            AssistantState.SPEAKING
+        } else {
+            AssistantState.IDLE
+        }
+        speak(text)
+    }
+
+    private fun addMessage(text: String, sender: Sender, source: MessageSource) {
+        _messages.value = _messages.value + ChatMessage(text = text, sender = sender, source = source)
+    }
+}suggestion
                     _pendingAction.value = PendingAction("AI_COMMAND", suggestion, "Run: $label?", label)
                     deliver("${outcome.text} Should I run: $label?", MessageSource.ONLINE_AI, speak)
                 } else {
