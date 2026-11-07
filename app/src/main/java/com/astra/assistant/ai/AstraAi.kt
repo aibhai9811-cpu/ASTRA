@@ -5,6 +5,7 @@ import android.os.SystemClock
 import com.astra.assistant.commands.CommandExecutionResult
 import com.astra.assistant.commands.CommandProcessor
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -30,9 +31,11 @@ object AstraAi {
 
     @Volatile private var lastText = ""
     @Volatile private var lastAt = 0L
+    @Volatile private var lastReplyAt = 0L
     @Volatile private var store: GeminiSettingsStore? = null
 
     private const val DUPLICATE_WINDOW_MS = 3000L
+    private const val QUEUE_WAIT_MS = 20_000L
 
     private fun store(context: Context): GeminiSettingsStore {
         val existing = store
@@ -58,6 +61,13 @@ object AstraAi {
 
     fun clearHistory() {
         conversation.clear()
+        lastReplyAt = 0L
+    }
+
+    // True when Gemini answered recently, so a bare "yes" may be a follow-up to it.
+    fun hasRecentConversation(windowMs: Long = 90_000L): Boolean {
+        val at = lastReplyAt
+        return at != 0L && SystemClock.elapsedRealtime() - at < windowMs
     }
 
     suspend fun ask(
@@ -72,10 +82,16 @@ object AstraAi {
         if (message.isEmpty()) return AiOutcome.Ignored
         val now = SystemClock.elapsedRealtime()
         if (message == lastText && now - lastAt < DUPLICATE_WINDOW_MS) return AiOutcome.Ignored
-        if (!mutex.tryLock()) return AiOutcome.Busy
+
+        // Requests wait in line instead of being rejected as busy.
+        val acquired = withTimeoutOrNull(QUEUE_WAIT_MS) {
+            mutex.lock()
+            true
+        } ?: false
+        if (!acquired) return AiOutcome.Busy
         try {
             lastText = message
-            lastAt = now
+            lastAt = SystemClock.elapsedRealtime()
             return perform(settingsStore, settings, message, memoryProvider)
         } finally {
             mutex.unlock()
@@ -130,6 +146,7 @@ object AstraAi {
                 val reply = speakable(result.reply)
                 conversation.add("user", filteredMessage.text)
                 conversation.add("assistant", reply)
+                lastReplyAt = SystemClock.elapsedRealtime()
                 result.model?.let { settingsStore.saveStatus(it, settings.lastStatus) }
                 AiOutcome.Reply(reply, cleanSuggestion(result.suggestedCommand), result.actionLabel, filteredMessage.redactions)
             }
@@ -162,7 +179,7 @@ object AstraAi {
             .put("style", "short")
             .put("memoryContext", "")
         val summary = when (val result = repository.chat(url, token, payload)) {
-            is GeminiResult.Success -> "Connected. Gemini answered. Model: ${health.model.ifBlank { "unknown" }}."
+            is GeminiResult.Success -> "Connected. Gemini answered. Model: ${result.model ?: health.model.ifBlank { "unknown" }}."
             is GeminiResult.Failure -> result.message
         }
         settingsStore.saveStatus(health.model, summary)
