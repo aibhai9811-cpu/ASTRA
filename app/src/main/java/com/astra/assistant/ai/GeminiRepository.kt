@@ -93,7 +93,7 @@ class GeminiRepository {
             connection = conn
             conn.requestMethod = "POST"
             conn.connectTimeout = 8000
-            conn.readTimeout = 35000
+            conn.readTimeout = 25000
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
             conn.setRequestProperty("Accept", "application/json")
