@@ -501,6 +501,29 @@ class CommandProcessor(private val context: Context) {
         return best
     }
 
+    // Stop listening
+
+            // Polite phrasing: "can you open YouTube" becomes "open YouTube"
+        for (p in listOf("can you please ", "could you please ", "would you please ", "can you ", "could you ", "would you ", "please ", "kya aap ", "zara ")) {
+            if (lower.startsWith(p) && query.length > p.length + 2) {
+                return processCommand(query.substring(p.length))
+            }
+        }
+
+        // Questions go to the AI brain, never to phone controls
+        val asksTime = key == "time" || key == "what is the time" || key == "what's the time" ||
+            key == "whats the time" || key == "tell me the time" || lower.contains("what time") ||
+            lower.contains("time is it") || lower.contains("current time") || lower.contains("kitne baje") ||
+            lower.contains("time kya")
+        val questionStarts = listOf(
+            "what ", "what's ", "whats ", "why ", "how ", "who ", "whom ", "when ", "where ", "which ",
+            "explain", "describe", "define", "tell me ", "teach me", "is ", "are ", "does ", "do you ", "did ",
+            "kya ", "kaise ", "kyun ", "kyu ", "kaun ", "kab ", "kahan ", "kitna ", "kitne "
+        )
+        if (!asksTime && questionStarts.any { lower.startsWith(it) }) {
+            return CommandExecutionResult.RouteToAi(query)
+        }
+        
     // ---------------- parsing helpers ----------------
 
     // Returns the person to call, "" if none was said, or null if this is not a call command.
