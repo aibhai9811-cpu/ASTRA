@@ -45,7 +45,7 @@ class GeminiRepository {
                 last = result
                 val failure = result as GeminiResult.Failure
                 val retryable = failure.kind == GeminiResult.Kind.NETWORK ||
-                    failure.kind == GeminiResult.Kind.TIMEOUT ||
+                    
                     failure.kind == GeminiResult.Kind.SERVER
                 if (!retryable || attempt >= MAX_ATTEMPTS) return@withContext failure
                 delay(700L * attempt)
