@@ -31,7 +31,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import java.util.Locale
 
 class ListenService : Service() {
 
@@ -40,8 +39,6 @@ class ListenService : Service() {
     private var memoryRepository: AstraMemoryRepository? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var wakeLock: PowerManager.WakeLock? = null
-    private var pending: PendingAction? = null
-    private var pendingExpiresAt = 0L
     private var followUpUntil = 0L
     private var shownSetupHint = false
 
@@ -153,39 +150,37 @@ class ListenService : Service() {
         val text = raw.trim()
         if (text.isEmpty()) return
         val now = SystemClock.elapsedRealtime()
+        val stripped = WakeWord.strip(text)
 
-        // 1. Waiting for a yes/no (call, text message or a Gemini suggestion)
-        val waiting = pending
-        if (waiting != null) {
-            pending = null
-            if (now <= pendingExpiresAt) {
-                val answer = text.lowercase(Locale.ROOT).trimEnd('.', '!', '?', ' ')
-                if (answer in YES_WORDS) {
-                    val engine = processor
-                    if (engine == null) {
-                        reply(text, "ASTRA is not ready yet.")
+        // 1. Confirmation has the highest priority and never reaches Gemini.
+        if (ConfirmationManager.peek() != null) {
+            when (ConfirmationManager.interpret(text)) {
+                ConfirmationManager.Answer.YES -> {
+                    val action = ConfirmationManager.take()
+                    if (action != null) {
+                        confirmAction(text, action)
                         return
                     }
-                    scope.launch {
-                        val result = if (waiting.actionType == "AI_COMMAND") {
-                            AstraAi.runSuggested(engine, waiting.target)
-                        } else {
-                            engine.executeConfirmedAction(waiting)
-                        }
-                        presentResult(text, result)
-                    }
-                    return
                 }
-                if (answer in NO_WORDS) {
+                ConfirmationManager.Answer.NO -> {
+                    ConfirmationManager.take()
                     reply(text, "Cancelled.")
                     return
+                }
+                ConfirmationManager.Answer.UNCLEAR -> {
+                    val looksLikeNewCommand = stripped != null || text.split(" ").size > 7
+                    if (looksLikeNewCommand || ConfirmationManager.noteUnclear() >= 2) {
+                        ConfirmationManager.clear()
+                    } else {
+                        reply(text, "I am waiting for a yes or no.")
+                        return
+                    }
                 }
             }
         }
 
-        // 2. Wake word is required when ASTRA is not on screen
+        // 2. The wake word is required when ASTRA is not on screen.
         var command = text
-        val stripped = WakeWord.strip(text)
         if (!AssistantBridge.appVisible) {
             if (stripped == null) {
                 if (now > followUpUntil) return
@@ -201,7 +196,33 @@ class ListenService : Service() {
             command = stripped
         }
         followUpUntil = 0L
+
+        // 3. A bare yes or no with nothing waiting is not a question for Gemini.
+        if (ConfirmationManager.isBareAnswer(command) && !AstraAi.hasRecentConversation()) {
+            reply(text, "There is nothing waiting for confirmation.")
+            return
+        }
         runCommand(command)
+    }
+
+    private fun confirmAction(userText: String, action: PendingAction) {
+        val engine = processor
+        if (engine == null) {
+            reply(userText, "ASTRA is not ready yet.")
+            return
+        }
+        scope.launch {
+            val result: CommandExecutionResult = try {
+                if (action.actionType == "AI_COMMAND") {
+                    AstraAi.runSuggested(engine, action.target)
+                } else {
+                    engine.executeConfirmedAction(action)
+                }
+            } catch (e: Exception) {
+                CommandExecutionResult.Error("Could not complete the action: ${e.message ?: "unknown error"}")
+            }
+            presentResult(userText, result)
+        }
     }
 
     private fun runCommand(command: String) {
@@ -231,8 +252,7 @@ class ListenService : Service() {
                 }
             }
             is CommandExecutionResult.RequiresConfirmation -> {
-                pending = result.pendingAction
-                pendingExpiresAt = SystemClock.elapsedRealtime() + 20000
+                ConfirmationManager.set(result.pendingAction)
                 reply(userText, result.pendingAction.prompt + " Say yes or no.")
             }
             is CommandExecutionResult.Error -> reply(userText, result.error)
@@ -250,6 +270,66 @@ class ListenService : Service() {
                 followUpUntil = SystemClock.elapsedRealtime() + FOLLOW_UP_MS
                 val suggestion = outcome.suggestedCommand
                 if (suggestion != null) {
+                    val label = outcome.actionLabel ?: suggestion
+                    ConfirmationManager.set(PendingAction("AI_COMMAND", suggestion, "Run: $label?", label))
+                    reply(spoken, "${outcome.text} Should I run: $label? Say yes or no.")
+                } else {
+                    reply(spoken, outcome.text)
+                }
+            }
+            is AiOutcome.Failure -> reply(spoken, outcome.message)
+            AiOutcome.Busy -> reply(spoken, "The AI is still working on earlier questions. Please try again in a moment.")
+            AiOutcome.Ignored -> AssistantBridge.phase.value = AssistantState.LISTENING
+            AiOutcome.NotConfigured -> {
+                if (!shownSetupHint) {
+                    shownSetupHint = true
+                    AssistantBridge.notices.tryEmit("Gemini is not set up yet. Open Settings to connect it.")
+                }
+                reply(spoken, ResearchService.lookup(query))
+            }
+        }
+    }
+
+    private fun reply(userText: String, text: String) {
+        AssistantBridge.exchanges.tryEmit(AssistantBridge.Exchange(userText, text))
+        voice?.speak(text)
+    }
+
+    override fun onDestroy() {
+        voice?.shutdown()
+        voice = null
+        scope.cancel()
+        wakeLock?.let { if (it.isHeld) it.release() }
+        ConfirmationManager.clear()
+        AssistantBridge.active.value = false
+        AssistantBridge.phase.value = AssistantState.IDLE
+        AssistantBridge.partial.value = ""
+        super.onDestroy()
+    }
+
+    companion object {
+        private const val TAG = "ASTRA_SERVICE"
+        private const val CHANNEL_ID = "astra_listen"
+        private const val NOTIFICATION_ID = 4711
+        private const val ACTION_STOP = "com.astra.assistant.STOP_LISTENING"
+        private const val ACTION_HUSH = "com.astra.assistant.HUSH"
+        private const val FOLLOW_UP_MS = 25000L
+
+        fun start(context: Context) {
+            context.startForegroundService(Intent(context, ListenService::class.java))
+        }
+
+        fun stop(context: Context) {
+            context.stopService(Intent(context, ListenService::class.java))
+        }
+
+        fun hush(context: Context) {
+            if (AssistantBridge.active.value) {
+                context.startService(Intent(context, ListenService::class.java).setAction(ACTION_HUSH))
+            }
+        }
+    }
+}{
                     val label = outcome.actionLabel ?: suggestion
                     pending = PendingAction("AI_COMMAND", suggestion, "Run: $label?", label)
                     pendingExpiresAt = SystemClock.elapsedRealtime() + 20000
