@@ -44,6 +44,12 @@ class VoiceManager(
     var speechRate: Float = 1.0f
     var speechPitch: Float = 0.95f
 
+    // When true the microphone stays on while ASTRA talks, so "ASTRA stop" can interrupt it.
+    var allowBargeIn: Boolean = true
+
+    val isSpeaking: Boolean
+        get() = isSpeakingNow
+
     var continuousMode: Boolean = false
         set(value) {
             field = value
@@ -53,7 +59,7 @@ class VoiceManager(
         }
 
     private val restartRunnable = Runnable {
-        if (continuousMode && !isSpeakingNow && !isShutDown) {
+        if (continuousMode && (!isSpeakingNow || allowBargeIn) && !isShutDown) {
             startListening()
         }
     }
@@ -209,8 +215,10 @@ class VoiceManager(
             return
         }
         isSpeakingNow = true
-        mainHandler.removeCallbacks(restartRunnable)
-        speechRecognizer?.cancel()
+        if (!allowBargeIn) {
+            mainHandler.removeCallbacks(restartRunnable)
+            speechRecognizer?.cancel()
+        }
         val hasDevanagari = text.any { it in '\u0900'..'\u097F' }
         textToSpeech?.language = if (hasDevanagari) Locale("hi", "IN") else Locale("en", "IN")
         textToSpeech?.setSpeechRate(speechRate)
