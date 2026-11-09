@@ -311,38 +311,4 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun addMessage(text: String, sender: Sender, source: MessageSource) {
         _messages.value = _messages.value + ChatMessage(text = text, sender = sender, source = source)
     }
-}suggestion
-                    _pendingAction.value = PendingAction("AI_COMMAND", suggestion, "Run: $label?", label)
-                    deliver("${outcome.text} Should I run: $label?", MessageSource.ONLINE_AI, speak)
-                } else {
-                    deliver(outcome.text, MessageSource.ONLINE_AI, speak)
-                }
-            }
-            is AiOutcome.Failure -> deliver(outcome.message, MessageSource.LOCAL_ROUTER, speak)
-            AiOutcome.Busy ->
-                deliver("I am still working on your last question.", MessageSource.LOCAL_ROUTER, speak)
-            AiOutcome.Ignored -> _assistantState.value = AssistantState.IDLE
-            AiOutcome.NotConfigured -> {
-                if (!shownSetupHint) {
-                    shownSetupHint = true
-                    _notice.value = "Gemini is not set up yet. Open Settings to connect it."
-                }
-                deliver(ResearchService.lookup(query), MessageSource.ONLINE_AI, speak)
-            }
-        }
-    }
-
-    private fun deliver(text: String, source: MessageSource, speak: (String) -> Unit) {
-        addMessage(text, Sender.ASSISTANT, source)
-        _assistantState.value = if (_preferences.value.autoSpeakResponses) {
-            AssistantState.SPEAKING
-        } else {
-            AssistantState.IDLE
-        }
-        speak(text)
-    }
-
-    private fun addMessage(text: String, sender: Sender, source: MessageSource) {
-        _messages.value = _messages.value + ChatMessage(text = text, sender = sender, source = source)
-    }
 }
