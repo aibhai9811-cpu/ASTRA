@@ -17,6 +17,7 @@ import android.util.Log
 import com.astra.assistant.MainActivity
 import com.astra.assistant.ai.AiOutcome
 import com.astra.assistant.ai.AstraAi
+import com.astra.assistant.audio.AudioRouteManager
 import com.astra.assistant.commands.CommandExecutionResult
 import com.astra.assistant.commands.CommandProcessor
 import com.astra.assistant.data.AstraDatabase
@@ -31,16 +32,20 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.util.Locale
 
 class ListenService : Service() {
 
     private var voice: VoiceManager? = null
     private var processor: CommandProcessor? = null
     private var memoryRepository: AstraMemoryRepository? = null
+    private var audioRoute: AudioRouteManager? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var wakeLock: PowerManager.WakeLock? = null
     private var followUpUntil = 0L
     private var shownSetupHint = false
+    private var lastSpoken: String? = null
+    private var speechEndedAt = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -130,26 +135,83 @@ class ListenService : Service() {
         voice = VoiceManager(
             context = applicationContext,
             onSpeechRecognized = { text -> handleSpeech(text) },
-            onPartialSpeech = { text -> AssistantBridge.partial.value = text },
-            onStateChange = { speaking ->
-                AssistantBridge.phase.value = if (speaking) AssistantState.SPEAKING else AssistantState.LISTENING
+            onPartialSpeech = { text ->
+                if (voice?.isSpeaking == true) {
+                    if (isHushPhrase(text)) hush()
+                } else {
+                    AssistantBridge.partial.value = text
+                }
             },
-            onEndOfSpeech = { AssistantBridge.phase.value = AssistantState.PROCESSING },
+            onStateChange = { speaking ->
+                if (speaking) {
+                    AssistantBridge.phase.value = AssistantState.SPEAKING
+                } else {
+                    speechEndedAt = SystemClock.elapsedRealtime()
+                    AssistantBridge.phase.value = AssistantState.LISTENING
+                }
+            },
+            onEndOfSpeech = {
+                if (voice?.isSpeaking != true) AssistantBridge.phase.value = AssistantState.PROCESSING
+            },
             onError = { message ->
                 AssistantBridge.notices.tryEmit(message)
                 if (voice?.continuousMode != true) stopSelf()
             },
             onListeningStarted = {
-                AssistantBridge.partial.value = ""
-                AssistantBridge.phase.value = AssistantState.LISTENING
+                if (voice?.isSpeaking != true) {
+                    AssistantBridge.partial.value = ""
+                    AssistantBridge.phase.value = AssistantState.LISTENING
+                }
             }
         )
+        audioRoute = AudioRouteManager(applicationContext) { handleRouteChanged() }
+        audioRoute?.start()
+        scope.launch {
+            AssistantBridge.asyncReplies.collect { text -> replyAsync(text) }
+        }
+    }
+
+    private fun handleRouteChanged() {
+        val engine = voice ?: return
+        if (engine.continuousMode) engine.startListening()
+    }
+
+    private fun normalize(raw: String): String =
+        raw.lowercase(Locale.ROOT).replace(NOISE, " ").replace(SPACES, " ").trim()
+
+    private fun isHushPhrase(raw: String): Boolean {
+        val base = WakeWord.strip(raw) ?: raw
+        return normalize(base) in HUSH_PHRASES
+    }
+
+    private fun hush() {
+        voice?.stopSpeaking()
+        AssistantBridge.phase.value = AssistantState.LISTENING
+    }
+
+    // ASTRA's own voice can be picked up by the microphone. Ignore what it just said.
+    private fun looksLikeEcho(text: String): Boolean {
+        val spoken = lastSpoken ?: return false
+        val now = SystemClock.elapsedRealtime()
+        if (now - speechEndedAt > 8000) return false
+        val words = normalize(text).split(" ").filter { it.isNotEmpty() }
+        if (words.size < 2) return false
+        val spokenWords = normalize(spoken).split(" ").toSet()
+        return words.count { it in spokenWords } >= words.size * 0.8
     }
 
     private fun handleSpeech(raw: String) {
         val text = raw.trim()
         if (text.isEmpty()) return
         val now = SystemClock.elapsedRealtime()
+
+        // 0. While ASTRA talks only a stop phrase is accepted. Anything else is probably its own voice.
+        if (voice?.isSpeaking == true) {
+            if (isHushPhrase(text)) hush()
+            return
+        }
+        if (looksLikeEcho(text)) return
+
         val stripped = WakeWord.strip(text)
 
         // 1. Confirmation has the highest priority and never reaches Gemini.
@@ -244,6 +306,18 @@ class ListenService : Service() {
     private suspend fun presentResult(userText: String, result: CommandExecutionResult?) {
         when (result) {
             is CommandExecutionResult.Handled -> {
+                if (result.actionType == "HUSH") {
+                    voice?.stopSpeaking()
+                    AssistantBridge.phase.value = AssistantState.LISTENING
+                    return
+                }
+                if (result.actionType == "USE_BT_MIC" || result.actionType == "USE_PHONE_MIC") {
+                    AudioRouteManager.setPreferBluetooth(applicationContext, result.actionType == "USE_BT_MIC")
+                    val status = audioRoute?.applyRoute().orEmpty()
+                    handleRouteChanged()
+                    reply(userText, "${result.message} $status".trim())
+                    return
+                }
                 reply(userText, result.message)
                 if (result.actionType == "STOP_LISTENING") {
                     voice?.continuousMode = false
@@ -291,11 +365,18 @@ class ListenService : Service() {
     }
 
     private fun reply(userText: String, text: String) {
+        lastSpoken = text
         AssistantBridge.exchanges.tryEmit(AssistantBridge.Exchange(userText, text))
         voice?.speak(text)
     }
 
+    private fun replyAsync(text: String) {
+        reply("(phone control)", text)
+    }
+
     override fun onDestroy() {
+        audioRoute?.stop()
+        audioRoute = null
         voice?.shutdown()
         voice = null
         scope.cancel()
@@ -314,6 +395,14 @@ class ListenService : Service() {
         private const val ACTION_STOP = "com.astra.assistant.STOP_LISTENING"
         private const val ACTION_HUSH = "com.astra.assistant.HUSH"
         private const val FOLLOW_UP_MS = 25000L
+
+        private val NOISE = Regex("[^\\p{L}\\p{M}\\p{N} ]")
+        private val SPACES = Regex("\\s+")
+
+        private val HUSH_PHRASES = setOf(
+            "stop", "quiet", "quite", "be quiet", "shut up", "silence", "stop talking", "stop speaking",
+            "enough", "chup", "chup ho jao", "chup raho", "bas", "bas karo", "बस", "चुप", "चुप हो जाओ"
+        )
 
         fun start(context: Context) {
             context.startForegroundService(Intent(context, ListenService::class.java))
