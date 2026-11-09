@@ -14,6 +14,9 @@ object AssistantBridge {
     val exchanges = MutableSharedFlow<Exchange>(extraBufferCapacity = 16)
     val notices = MutableSharedFlow<String>(extraBufferCapacity = 8)
 
+    // Results of actions that finish a moment later, such as tapping Quick Settings tiles.
+    val asyncReplies = MutableSharedFlow<String>(extraBufferCapacity = 8)
+
     @Volatile
     var appVisible: Boolean = false
 }
