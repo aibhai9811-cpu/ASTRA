@@ -2,31 +2,26 @@ package com.astra.assistant.commands
 
 import android.Manifest
 import android.accessibilityservice.AccessibilityService
-import android.app.SearchManager
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.SystemClock
 import android.provider.AlarmClock
 import android.provider.ContactsContract
 import android.provider.MediaStore
 import android.provider.Settings
 import android.telecom.TelecomManager
 import android.telephony.SmsManager
-import android.view.KeyEvent
 import androidx.core.content.ContextCompat
 import com.astra.assistant.model.PendingAction
 import com.astra.assistant.service.AstraAccessibilityService
 import com.astra.assistant.util.Calculator
 import java.text.SimpleDateFormat
-import java.util.Calendar
 import java.util.Date
 import java.util.Locale
-import kotlin.math.roundToInt
 
 sealed class CommandExecutionResult {
     data class Handled(val message: String, val actionLabel: String? = null, val actionType: String? = null) : CommandExecutionResult()
@@ -37,133 +32,198 @@ sealed class CommandExecutionResult {
 
 class CommandProcessor(private val context: Context) {
 
-    private class MessageRequest(val viaWhatsApp: Boolean, val explicit: Boolean, val rest: String)
-    private class Choice(val kind: String, val body: String, val options: List<Pair<String, String>>)
+    private class MessageRequest(val viaWhatsApp: Boolean, val rest: String)
 
-    private val audio: AudioManager
-        get() = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-
-    // Local commands match only at the START of a sentence. Everything else goes to Gemini.
     fun processCommand(input: String): CommandExecutionResult {
-        val raw = input.trim()
-        if (raw.isEmpty()) return CommandExecutionResult.Error("No command text detected.")
-        val cmd = stripPoliteness(raw.trimEnd('.', '!', '?', ' '))
-        val lower = cmd.lowercase(Locale.ROOT)
-        if (lower.isEmpty()) return CommandExecutionResult.Error("No command text detected.")
+        val query = input.trim()
+        if (query.isEmpty()) {
+            return CommandExecutionResult.Error("No command text detected.")
+        }
+        val lower = query.lowercase(Locale.ROOT)
+        val key = lower.trimEnd('.', '!', '?', ' ')
 
-        // 1. Small talk, ASTRA's identity, maths
-        if (lower in GREETINGS) {
+        // Greetings
+        if (key in GREETINGS) {
             return CommandExecutionResult.Handled("Hello, sir. ASTRA is online and ready.", "Greeting", "GREETING")
         }
-        if (lower == "how are you" || lower == "kaise ho") {
+        if (key == "how are you" || key == "kaise ho") {
             return CommandExecutionResult.Handled("All systems nominal, sir. How can I help?", "Status", "STATUS")
         }
-        identityReply(lower)?.let {
+
+        // Questions about ASTRA itself
+        identityReply(lower, key)?.let {
             return CommandExecutionResult.Handled(it, "About ASTRA", "IDENTITY")
         }
-        Calculator.tryEvaluate(cmd)?.let {
+
+        // Maths
+        Calculator.tryEvaluate(query)?.let {
             return CommandExecutionResult.Handled(it, "Calculator", "CALCULATE")
         }
-        if (lower in STOP_WORDS) {
+
+        // Polite phrasing: "can you open YouTube" becomes "open YouTube"
+        for (p in listOf("can you please ", "could you please ", "would you please ", "can you ", "could you ", "would you ", "please ", "kya aap ", "zara ")) {
+            if (lower.startsWith(p) && query.length > p.length + 2) {
+                return processCommand(query.substring(p.length))
+            }
+        }
+
+        // Questions go to the AI brain, never to phone controls
+        val asksTime = key == "time" || key == "what is the time" || key == "what's the time" ||
+            key == "whats the time" || key == "tell me the time" || lower.contains("what time") ||
+            lower.contains("time is it") || lower.contains("current time") || lower.contains("kitne baje") ||
+            lower.contains("time kya")
+        val questionStarts = listOf(
+            "what ", "what's ", "whats ", "why ", "how ", "who ", "whom ", "when ", "where ", "which ",
+            "explain", "describe", "define", "tell me ", "teach me", "is ", "are ", "does ", "do you ", "did ",
+            "kya ", "kaise ", "kyun ", "kyu ", "kaun ", "kab ", "kahan ", "kitna ", "kitne "
+        )
+        if (!asksTime && questionStarts.any { lower.startsWith(it) }) {
+            return CommandExecutionResult.RouteToAi(query)
+        }
+
+        // Stop listening
+        if (key in STOP_WORDS) {
             return CommandExecutionResult.Handled("Continuous listening paused. Standing by.", "Pause Listening", "STOP_LISTENING")
         }
 
-        // 2. Phone navigation (needs the Accessibility service) and calls in progress
-        if (lower in BACK_WORDS) return navigate(AccessibilityService.GLOBAL_ACTION_BACK, "Going back.", "Back", "NAVIGATE_BACK")
-        if (lower in HOME_WORDS) return navigate(AccessibilityService.GLOBAL_ACTION_HOME, "Going to the home screen.", "Home", "NAVIGATE_HOME")
-        if (lower in RECENT_WORDS) return navigate(AccessibilityService.GLOBAL_ACTION_RECENTS, "Showing recent apps.", "Recents", "NAVIGATE_RECENTS")
-        if (lower in NOTIFICATION_WORDS) return navigate(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS, "Opening notifications.", "Notifications", "NAVIGATE_NOTIFICATIONS")
-        if (lower in SCREENSHOT_WORDS) return navigate(AccessibilityService.GLOBAL_ACTION_TAKE_SCREENSHOT, "Taking a screenshot.", "Screenshot", "SCREENSHOT")
-        if (lower in ANSWER_WORDS) return answerCall()
-        if (lower in END_CALL_WORDS) return endCall()
-        if (lower in ACCESSIBILITY_PHRASES) {
-            return if (launch(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))) {
-                CommandExecutionResult.Handled("Opening Accessibility settings. Turn on ASTRA there.", "Accessibility", "OPEN_ACCESSIBILITY")
-            } else {
-                CommandExecutionResult.Error("I could not open Accessibility settings.")
-            }
-        }
+        // Phone-wide navigation (needs the Accessibility service)
+        if (key in BACK_WORDS) return navigate(AccessibilityService.GLOBAL_ACTION_BACK, "Going back.", "Back", "NAVIGATE_BACK")
+        if (key in HOME_WORDS) return navigate(AccessibilityService.GLOBAL_ACTION_HOME, "Going to the home screen.", "Home", "NAVIGATE_HOME")
+        if (key in RECENT_WORDS) return navigate(AccessibilityService.GLOBAL_ACTION_RECENTS, "Showing recent apps.", "Recents", "NAVIGATE_RECENTS")
+        if (key in NOTIFICATION_WORDS) return navigate(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS, "Opening notifications.", "Notifications", "NAVIGATE_NOTIFICATIONS")
+        if (key in SCREENSHOT_WORDS) return navigate(AccessibilityService.GLOBAL_ACTION_TAKE_SCREENSHOT, "Taking a screenshot.", "Screenshot", "SCREENSHOT")
 
-        // 3. Time and date
-        if (lower in TIME_QUERIES) {
-            val formatted = SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date())
-            return CommandExecutionResult.Handled("The time is $formatted.", "Time", "GET_TIME")
-        }
-        if (lower in DATE_QUERIES) {
-            val formatted = SimpleDateFormat("EEEE, d MMMM yyyy", Locale.getDefault()).format(Date())
-            return CommandExecutionResult.Handled("Today is $formatted.", "Date", "GET_DATE")
-        }
+        // Incoming call control
+        if (key in ANSWER_WORDS) return answerCall()
+        if (key in END_CALL_WORDS) return endCall()
 
-        // 4. System controls
-        mediaCommand(lower)?.let { return it }
-        volumeCommand(lower)?.let { return it }
-        brightnessCommand(lower)?.let { return it }
-        alarmCommand(cmd, lower)?.let { return it }
-
-        // 5. WhatsApp, text messages, calls
-        whatsappCommand(cmd, lower)?.let { return it }
-        messageCommand(cmd)?.let { return it }
-        callCommand(cmd)?.let { return it }
-
-        // 6. Media search, apps, maps, web
-        youtubeCommand(cmd)?.let { return it }
-        playCommand(cmd)?.let { return it }
-        appCommand(cmd)?.let { return it }
-        mapsCommand(cmd)?.let { return it }
-        searchCommand(cmd)?.let { return it }
-        if (lower in CLEAR_WORDS) {
-            return CommandExecutionResult.RequiresConfirmation(
-                PendingAction("CLEAR_HISTORY", "all", "Wipe the conversation history?", "Wipe Logs")
+        // Accessibility settings
+        if (lower.contains("accessibility")) {
+            launch(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            return CommandExecutionResult.Handled(
+                "Opening Accessibility settings. Turn on ASTRA there.", "Accessibility", "OPEN_ACCESSIBILITY"
             )
         }
 
-        return CommandExecutionResult.RouteToAi(raw)
-    }
+        // Time
+        if (key == "time" || lower.contains("what time") || lower.contains("current time") ||
+            lower.contains("the time") || lower.contains("time is it") ||
+            lower.contains("समय") || lower.contains("बजे")
+        ) {
+            val formatted = SimpleDateFormat("h:mm a, EEEE, MMM d", Locale.getDefault()).format(Date())
+            return CommandExecutionResult.Handled("The current time is $formatted, sir.", "Time Query", "GET_TIME")
+        }
 
-    fun executeConfirmedAction(action: PendingAction): CommandExecutionResult {
-        return when (action.actionType) {
-            "CALL_PHONE" -> placeCall(action.target, false, action.label)
-            "CALL_SPEAKER" -> placeCall(action.target, true, action.label)
-            "SEND_SMS" -> {
-                val parts = action.target.split("\n", limit = 2)
-                val number = parts[0]
-                val body = parts.getOrElse(1) { "" }
-                if (!hasPermission(Manifest.permission.SEND_SMS)) {
-                    CommandExecutionResult.Error("I need the SMS permission to send text messages.")
-                } else if (body.isBlank()) {
-                    CommandExecutionResult.Error("The message was empty.")
-                } else {
-                    sendSms(number, body)
-                    CommandExecutionResult.Handled("I sent the text message. Android does not tell me if it was delivered.", action.label)
+        // Open-ended questions and follow-ups go to the AI brain
+        val aiStarts = listOf(
+            "how ", "why ", "which ", "describe ", "compare ", "summarize ", "summarise ", "translate ",
+            "teach me ", "suggest ", "recommend ", "difference between ", "can you explain", "could you explain",
+            "help me understand", "give me an example", "give an example", "in hindi", "in english", "in hinglish",
+            "explain it", "explain this", "when did ", "when was ", "samjhao", "isko explain"
+        )
+        if (aiStarts.any { lower.startsWith(it) }) {
+            return CommandExecutionResult.RouteToAi(query)
+        }
+
+        // Research and information questions
+        if (RESEARCH_PREFIXES.any { lower == it || lower.startsWith("$it ") } ||
+            RESEARCH_SUFFIXES.any { key.endsWith(" $it") }
+        ) {
+            return CommandExecutionResult.RouteToAi(query)
+        }
+
+        // Settings
+        if (lower.contains("setting") || lower.contains("सेटिंग")) {
+            launch(Intent(Settings.ACTION_SETTINGS))
+            return CommandExecutionResult.Handled("Opening Android device settings.", "Settings", "OPEN_SETTINGS")
+        }
+
+        // YouTube
+        if (lower.contains("youtube") || lower.contains("यूट्यूब")) {
+            val queryParam = query.replace("(?i)^(open|launch|search|on)?\\s*(youtube|यूट्यूब)\\s*".toRegex(), "").trim()
+            val intent = if (queryParam.isNotEmpty()) {
+                Intent(Intent.ACTION_SEARCH).apply {
+                    setPackage("com.google.android.youtube")
+                    putExtra("query", queryParam)
                 }
+            } else {
+                context.packageManager.getLaunchIntentForPackage("com.google.android.youtube")
+                    ?: Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com"))
             }
-            "SEND_WHATSAPP" -> {
-                val parts = action.target.split("\n", limit = 2)
-                val number = parts[0]
-                val body = parts.getOrElse(1) { "" }
-                if (body.isBlank()) {
-                    CommandExecutionResult.Error("The message was empty.")
-                } else if (!openWhatsAppChatUri(number, body)) {
-                    CommandExecutionResult.Error("I could not open WhatsApp. Is it installed?")
-                } else {
-                    val service = AstraAccessibilityService.instance
-                    if (service != null) {
-                        service.autoSendWhatsApp()
-                        CommandExecutionResult.Handled("WhatsApp is open with your message. I am pressing send. Please check that it went through.", action.label)
-                    } else {
-                        CommandExecutionResult.Handled("WhatsApp is open with your message. Tap send to finish.", action.label)
-                    }
-                }
+            launch(intent)
+            return CommandExecutionResult.Handled("Opening YouTube.", "YouTube", "OPEN_YOUTUBE")
+        }
+
+        // Camera
+        if (lower.contains("camera") || lower.contains("कैमरा") || lower.contains("फोटो")) {
+            launch(Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA))
+            return CommandExecutionResult.Handled("Opening camera viewfinder.", "Camera", "OPEN_CAMERA")
+        }
+
+        // Alarms and clock
+        if (lower.contains("alarm") || lower.contains("अलार्म") || lower.contains("clock")) {
+            launch(Intent(AlarmClock.ACTION_SHOW_ALARMS))
+            return CommandExecutionResult.Handled("Opening Android clock and alarms.", "Clock & Alarms", "OPEN_CLOCK")
+        }
+
+        // Music
+        if (lower.contains("play music") || lower.contains("spotify") || lower.contains("gaana")) {
+            launch(Intent(MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH))
+            return CommandExecutionResult.Handled("Starting media playback.", "Play Media", "PLAY_MEDIA")
+        }
+
+        // Maps
+        if (lower.contains("maps") || lower.contains("navigate") || lower.contains("रास्ता")) {
+            val dest = query.replace("(?i)^(open|launch|navigate|directions|to)?\\s*(maps?)?\\s*(to)?\\s*".toRegex(), "").trim()
+            val uri = if (dest.isNotEmpty()) Uri.parse("geo:0,0?q=" + Uri.encode(dest)) else Uri.parse("geo:0,0")
+            launch(Intent(Intent.ACTION_VIEW, uri).apply { setPackage("com.google.android.apps.maps") })
+            return CommandExecutionResult.Handled("Launching Google Maps.", "Maps", "OPEN_MAPS")
+        }
+
+        // Text message or WhatsApp message
+        val messageRequest = parseMessage(query)
+        if (messageRequest != null) {
+            return prepareMessage(messageRequest)
+        }
+
+        // Make a call (optionally on speaker)
+        val wantsSpeaker = SPEAKER_PHRASE.containsMatchIn(query)
+        val callQuery = query.replace(SPEAKER_PHRASE, "").trim().trimEnd(',', '.', ' ')
+        val callTarget = extractCallTarget(callQuery, callQuery.lowercase(Locale.ROOT))
+        if (callTarget != null) {
+            if (callTarget.isEmpty()) {
+                return CommandExecutionResult.Error("Who should I call?")
             }
-            "WHATSAPP_CALL", "WHATSAPP_VIDEO" -> {
-                val video = action.actionType == "WHATSAPP_VIDEO"
-                val parts = action.target.split("\n", limit = 2)
-                val number = parts[0]
-                val name = parts.getOrElse(1) { "the contact" }
-                val call = findWhatsAppCall(number, video)
-                if (call == null) {
-                    if (openWhatsAppChatUri(number, null)) {
-                        CommandExecutionResult       // Open any installed app
+            if (!looksLikeNumber(callTarget) && !hasPermission(Manifest.permission.READ_CONTACTS)) {
+                return CommandExecutionResult.Error("I need the Contacts permission to find $callTarget. Open ASTRA and allow it.")
+            }
+            val contact = resolveContact(callTarget)
+                ?: return CommandExecutionResult.Error("I could not find $callTarget in your contacts.")
+            return CommandExecutionResult.RequiresConfirmation(
+                PendingAction(
+                    if (wantsSpeaker) "CALL_SPEAKER" else "CALL_PHONE",
+                    contact.second,
+                    if (wantsSpeaker) "Call ${contact.first} on speaker?" else "Call ${contact.first}?",
+                    "Call ${contact.first}"
+                )
+            )
+        }
+
+        // Clear history
+        if (lower.contains("clear history") || lower.contains("wipe data")) {
+            return CommandExecutionResult.RequiresConfirmation(
+                PendingAction("CLEAR_HISTORY", "all", "Confirm permanent wipe of all conversation history?", "Wipe Logs")
+            )
+        }
+
+        // Web search
+        val searchTerm = extractSearchTerm(query, lower)
+        if (searchTerm != null && searchTerm.isNotEmpty()) {
+            launch(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + Uri.encode(searchTerm))))
+            return CommandExecutionResult.Handled("Searching the web for $searchTerm.", "Web Search", "WEB_SEARCH")
+        }
+
+        // Open any installed app
         val appName = extractAppName(query, lower)
         if (appName != null && appName.isNotEmpty()) {
             val found = findApp(appName)
@@ -348,7 +408,7 @@ class CommandProcessor(private val context: Context) {
             number = split.second
             body = cleanBody(split.third)
         } else {
-            val separator = SMS_SEPARATOR.find(request.rest)
+          val separator = SMS_SEPARATOR.find(request.rest)
                 ?: return CommandExecutionResult.Error("I could not tell who to message. Say, text Rahul, I will be late.")
             val name = request.rest.substring(0, separator.range.first).trim()
             val contact = resolveContact(name)
@@ -501,29 +561,6 @@ class CommandProcessor(private val context: Context) {
         return best
     }
 
-    // Stop listening
-
-            // Polite phrasing: "can you open YouTube" becomes "open YouTube"
-        for (p in listOf("can you please ", "could you please ", "would you please ", "can you ", "could you ", "would you ", "please ", "kya aap ", "zara ")) {
-            if (lower.startsWith(p) && query.length > p.length + 2) {
-                return processCommand(query.substring(p.length))
-            }
-        }
-
-        // Questions go to the AI brain, never to phone controls
-        val asksTime = key == "time" || key == "what is the time" || key == "what's the time" ||
-            key == "whats the time" || key == "tell me the time" || lower.contains("what time") ||
-            lower.contains("time is it") || lower.contains("current time") || lower.contains("kitne baje") ||
-            lower.contains("time kya")
-        val questionStarts = listOf(
-            "what ", "what's ", "whats ", "why ", "how ", "who ", "whom ", "when ", "where ", "which ",
-            "explain", "describe", "define", "tell me ", "teach me", "is ", "are ", "does ", "do you ", "did ",
-            "kya ", "kaise ", "kyun ", "kyu ", "kaun ", "kab ", "kahan ", "kitna ", "kitne "
-        )
-        if (!asksTime && questionStarts.any { lower.startsWith(it) }) {
-            return CommandExecutionResult.RouteToAi(query)
-        }
-        
     // ---------------- parsing helpers ----------------
 
     // Returns the person to call, "" if none was said, or null if this is not a call command.
@@ -585,7 +622,7 @@ class CommandProcessor(private val context: Context) {
 
     companion object {
         // Change this to the name you want ASTRA to give when asked who made it.
-        private const val CREATOR = "Gautam Buddh Kumar Sah"
+        private const val CREATOR = "AiBhai"
 
         private const val ACCESSIBILITY_HINT =
             "Turn on ASTRA in Settings, Accessibility, to use Back, Home, Recents and Screenshot. Say open accessibility settings."
