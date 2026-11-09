@@ -15,9 +15,11 @@ import android.provider.MediaStore
 import android.provider.Settings
 import android.telecom.TelecomManager
 import android.telephony.SmsManager
+import android.view.KeyEvent
 import androidx.core.content.ContextCompat
 import com.astra.assistant.model.PendingAction
 import com.astra.assistant.service.AstraAccessibilityService
+import com.astra.assistant.system.PhoneControls
 import com.astra.assistant.util.Calculator
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -33,6 +35,15 @@ sealed class CommandExecutionResult {
 class CommandProcessor(private val context: Context) {
 
     private class MessageRequest(val viaWhatsApp: Boolean, val rest: String)
+
+    private class ToggleTarget(
+        val id: String,
+        val spoken: String,
+        val keywords: List<String>,
+        val labels: List<String>
+    )
+
+    private val phone = PhoneControls(context)
 
     fun processCommand(input: String): CommandExecutionResult {
         val query = input.trim()
@@ -85,6 +96,37 @@ class CommandProcessor(private val context: Context) {
         if (key in STOP_WORDS) {
             return CommandExecutionResult.Handled("Continuous listening paused. Standing by.", "Pause Listening", "STOP_LISTENING")
         }
+
+        // Stop ASTRA's own speech
+        if (key in HUSH_WORDS) {
+            return CommandExecutionResult.Handled("Okay.", "Quiet", "HUSH")
+        }
+
+        // Microphone choice
+        if (key in USE_BT_MIC_WORDS) {
+            return CommandExecutionResult.Handled(
+                "Okay, I will use the earbud microphone when one is connected.", "Earbud mic", "USE_BT_MIC"
+            )
+        }
+        if (key in USE_PHONE_MIC_WORDS) {
+            return CommandExecutionResult.Handled("Okay, I will use the phone microphone.", "Phone mic", "USE_PHONE_MIC")
+        }
+
+        // Music playback
+        mediaCommand(query, lower, key)?.let { return it }
+
+        // Volume
+        volumeCommand(lower, key)?.let { return it }
+
+        // Brightness
+        if (lower.contains("brightness") || lower.contains("brightnes") || lower.contains("roshni") ||
+            lower.contains("ब्राइटनेस")
+        ) {
+            return brightnessCommand(lower)
+        }
+
+        // Flight mode, Bluetooth, Wi-Fi, mobile data, flashlight and similar switches
+        toggleCommand(lower)?.let { return it }
 
         // Phone-wide navigation (needs the Accessibility service)
         if (key in BACK_WORDS) return navigate(AccessibilityService.GLOBAL_ACTION_BACK, "Going back.", "Back", "NAVIGATE_BACK")
@@ -164,12 +206,6 @@ class CommandProcessor(private val context: Context) {
         if (lower.contains("alarm") || lower.contains("अलार्म") || lower.contains("clock")) {
             launch(Intent(AlarmClock.ACTION_SHOW_ALARMS))
             return CommandExecutionResult.Handled("Opening Android clock and alarms.", "Clock & Alarms", "OPEN_CLOCK")
-        }
-
-        // Music
-        if (lower.contains("play music") || lower.contains("spotify") || lower.contains("gaana")) {
-            launch(Intent(MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH))
-            return CommandExecutionResult.Handled("Starting media playback.", "Play Media", "PLAY_MEDIA")
         }
 
         // Maps
@@ -296,9 +332,220 @@ class CommandProcessor(private val context: Context) {
         }
         if (key in HELP_QUESTIONS) {
             return "I can open any app, call or text your contacts, send WhatsApp messages, go back or home, " +
-                "solve maths, search the web and research topics. Say ASTRA first when I am in the background."
+                "control music, volume and brightness, switch flight mode and Bluetooth, solve maths, search the web " +
+                "and answer questions. Say ASTRA first when I am in the background."
         }
         return null
+    }
+
+    // ---------------- music ----------------
+
+    private fun mediaCommand(query: String, lower: String, key: String): CommandExecutionResult? {
+        val k = key.removeSuffix(" please").trim()
+        if (k in MEDIA_NEXT) return sendMedia(KeyEvent.KEYCODE_MEDIA_NEXT, "Sent the next-song command to your music app.", "NEXT")
+        if (k in MEDIA_PREVIOUS) return sendMedia(KeyEvent.KEYCODE_MEDIA_PREVIOUS, "Sent the previous-song command to your music app.", "PREVIOUS")
+        if (k in MEDIA_PAUSE) return sendMedia(KeyEvent.KEYCODE_MEDIA_PAUSE, "Sent pause to your music app.", "PAUSE")
+        if (k in MEDIA_STOP) return sendMedia(KeyEvent.KEYCODE_MEDIA_STOP, "Sent stop to your music app.", "STOP")
+        if (k in MEDIA_PLAY) {
+            phone.mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY)
+            val note = if (phone.isMusicActive()) "Music is already playing." else
+                "Sent play to your music app. If nothing starts, tell me a song name."
+            return CommandExecutionResult.Handled(note, "Play", "PLAY")
+        }
+        val openAndPlay = OPEN_AND_PLAY.find(query)
+        if (openAndPlay != null) {
+            return playQuery(openAndPlay.groupValues[2], openAndPlay.groupValues[1], openAndPlay.groupValues[2])
+        }
+        if (lower.startsWith("play ")) {
+            val original = query.substring(5).trim()
+            val playOn = PLAY_ON.find(query)
+            if (playOn != null) {
+                return playQuery(playOn.groupValues[1], playOn.groupValues[2], original)
+            }
+            return playQuery(original, null, original)
+        }
+        return null
+    }
+
+    private fun sendMedia(keyCode: Int, message: String, type: String): CommandExecutionResult {
+        phone.mediaKey(keyCode)
+        return CommandExecutionResult.Handled(message, "Music", type)
+    }
+
+    private fun playQuery(rawQuery: String, appHint: String?, original: String): CommandExecutionResult {
+        var query = rawQuery
+        var app: Pair<String, Intent>? = null
+        if (!appHint.isNullOrBlank()) {
+            app = findApp(appHint.trim())
+            if (app == null) query = original
+        }
+        val cleaned = query
+            .replace(Regex("(?i)\\b(the\\s+)?(song|songs|gana|gaana|music|track)\\b"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        val finalQuery = if (cleaned.isBlank()) query.trim() else cleaned
+        if (finalQuery.isBlank()) {
+            phone.mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY)
+            return CommandExecutionResult.Handled("Sent play to your music app.", "Play", "PLAY")
+        }
+        val pkg = app?.second?.component?.packageName
+        if (pkg == "com.google.android.youtube") {
+            launch(phone.youtubeSearchIntent(finalQuery))
+            return CommandExecutionResult.Handled(
+                "Searching YouTube for $finalQuery. YouTube needs a tap on a result to start playing.",
+                "YouTube",
+                "YOUTUBE_SEARCH"
+            )
+        }
+        return try {
+            launch(phone.playFromSearchIntent(finalQuery, pkg))
+            CommandExecutionResult.Handled(
+                "Asking ${app?.first ?: "your music app"} to play $finalQuery.", "Play", "PLAY_QUERY"
+            )
+        } catch (e: ActivityNotFoundException) {
+            CommandExecutionResult.Error("I could not find a music app that can play $finalQuery.")
+        }
+    }
+
+    // ---------------- volume and brightness ----------------
+
+    private fun wordIndex(lower: String, word: String): Int {
+        val match = Regex("(?<![\\p{L}\\p{M}])" + Regex.escape(word) + "(?![\\p{L}\\p{M}])").find(lower)
+        return match?.range?.first ?: -1
+    }
+
+    // +1 for up words, -1 for down words, whichever comes first.
+    private fun direction(lower: String): Int {
+        var bestIndex = Int.MAX_VALUE
+        var dir = 0
+        for (w in UP_WORDS) {
+            val i = wordIndex(lower, w)
+            if (i >= 0 && i < bestIndex) {
+                bestIndex = i
+                dir = 1
+            }
+        }
+        for (w in DOWN_WORDS) {
+            val i = wordIndex(lower, w)
+            if (i >= 0 && i < bestIndex) {
+                bestIndex = i
+                dir = -1
+            }
+        }
+        return dir
+    }
+
+    private fun extractPercent(lower: String): Int? =
+        NUMBER.find(lower)?.groupValues?.get(1)?.toIntOrNull()?.coerceIn(0, 100)
+
+    private fun volumeStream(lower: String): PhoneControls.Stream = when {
+        lower.contains("ring") -> PhoneControls.Stream.RING
+        lower.contains("alarm") -> PhoneControls.Stream.ALARM
+        lower.contains("call") -> PhoneControls.Stream.CALL
+        lower.contains("notification") -> PhoneControls.Stream.NOTIFICATION
+        else -> PhoneControls.Stream.MEDIA
+    }
+
+    private fun volumeCommand(lower: String, key: String): CommandExecutionResult? {
+        val isUnmute = lower.contains("unmute")
+        val isMute = !isUnmute && Regex("\\bmute\\b").containsMatchIn(lower)
+        val mentionsVolume = lower.contains("volume") || lower.contains("awaz") || lower.contains("आवाज")
+        val loudWords = key in setOf("louder", "softer", "quieter", "speak louder", "speak softer")
+        if (!mentionsVolume && !isMute && !isUnmute && !loudWords) return null
+
+        val stream = volumeStream(lower)
+        val outcome = when {
+            isUnmute -> phone.mute(stream, false)
+            isMute -> phone.mute(stream, true)
+            else -> {
+                val dir = direction(lower)
+                val by = BY_NUMBER.find(lower)?.groupValues?.get(1)?.toIntOrNull()
+                val percent = extractPercent(lower)
+                when {
+                    by != null && dir != 0 -> phone.adjustVolume(stream, dir * by)
+                    percent != null -> phone.setVolumePercent(stream, percent)
+                    lower.contains("max") || lower.contains("full") -> phone.setVolumePercent(stream, 100)
+                    lower.contains("min") || lower.contains("zero") -> phone.setVolumePercent(stream, 0)
+                    dir != 0 -> phone.adjustVolume(stream, dir * 15)
+                    else -> return CommandExecutionResult.Error(
+                        "Say volume up, volume down, or set volume to 50 percent."
+                    )
+                }
+            }
+        }
+        return outcomeToResult(outcome, "Volume")
+    }
+
+    private fun brightnessCommand(lower: String): CommandExecutionResult {
+        val dir = direction(lower)
+        val by = BY_NUMBER.find(lower)?.groupValues?.get(1)?.toIntOrNull()
+        val percent = extractPercent(lower)
+        val outcome = when {
+            by != null && dir != 0 -> phone.adjustBrightness(dir * by)
+            percent != null -> phone.setBrightnessPercent(percent)
+            lower.contains("max") || lower.contains("full") -> phone.setBrightnessPercent(100)
+            lower.contains("min") || lower.contains("lowest") -> phone.setBrightnessPercent(5)
+            dir != 0 -> phone.adjustBrightness(dir * 20)
+            else -> return CommandExecutionResult.Error(
+                "Say increase brightness, decrease brightness, or set brightness to 50 percent."
+            )
+        }
+        return outcomeToResult(outcome, "Brightness")
+    }
+
+    private fun outcomeToResult(outcome: PhoneControls.Outcome, label: String): CommandExecutionResult {
+        if (outcome.needsWriteSettings) {
+            launch(phone.writeSettingsIntent())
+            return CommandExecutionResult.Error(outcome.message)
+        }
+        if (outcome.needsDndAccess) {
+            launch(phone.dndAccessIntent())
+            return CommandExecutionResult.Error(outcome.message)
+        }
+        return if (outcome.ok) {
+            CommandExecutionResult.Handled(outcome.message, label, "PHONE_CONTROL")
+        } else {
+            CommandExecutionResult.Error(outcome.message)
+        }
+    }
+
+    // ---------------- switches (flight mode, Bluetooth and so on) ----------------
+
+    private fun toggleCommand(lower: String): CommandExecutionResult? {
+        val target = TARGETS.firstOrNull { t -> t.keywords.any { lower.contains(it) } } ?: return null
+        val wantsOff = OFF_REGEX.containsMatchIn(lower)
+        val wantsOn = ON_REGEX.containsMatchIn(lower)
+        val wantsToggle = lower.contains("toggle")
+        if (!wantsOff && !wantsOn && !wantsToggle) return null
+        val desired: Boolean? = when {
+            wantsOff -> false
+            wantsOn -> true
+            else -> null
+        }
+
+        if (target.id == "torch") {
+            return outcomeToResult(phone.setTorch(desired), "Flashlight")
+        }
+
+        val service = AstraAccessibilityService.instance
+        if (service == null) {
+            launch(phone.settingsIntentFor(target.id))
+            return CommandExecutionResult.Handled(
+                "Accessibility is off, so I opened the ${target.spoken} settings. Please tap the switch yourself. " +
+                    "Turn on ASTRA in Accessibility to let me do it.",
+                target.spoken,
+                "TOGGLE"
+            )
+        }
+        service.toggleQuickSetting(target.labels, desired, target.spoken)
+        val verb = when (desired) {
+            true -> "turning on"
+            false -> "turning off"
+            null -> "toggling"
+        }
+        return CommandExecutionResult.Handled(
+            "Okay, $verb ${target.spoken} in Quick Settings.", target.spoken, "TOGGLE"
+        )
     }
 
     // ---------------- helpers ----------------
@@ -408,7 +655,7 @@ class CommandProcessor(private val context: Context) {
             number = split.second
             body = cleanBody(split.third)
         } else {
-          val separator = SMS_SEPARATOR.find(request.rest)
+            val separator = SMS_SEPARATOR.find(request.rest)
                 ?: return CommandExecutionResult.Error("I could not tell who to message. Say, text Rahul, I will be late.")
             val name = request.rest.substring(0, separator.range.first).trim()
             val contact = resolveContact(name)
@@ -622,7 +869,7 @@ class CommandProcessor(private val context: Context) {
 
     companion object {
         // Change this to the name you want ASTRA to give when asked who made it.
-        private const val CREATOR = "AiBhai"
+        private const val CREATOR = "Gautam Buddh Kumar Sah"
 
         private const val ACCESSIBILITY_HINT =
             "Turn on ASTRA in Settings, Accessibility, to use Back, Home, Recents and Screenshot. Say open accessibility settings."
@@ -637,7 +884,7 @@ class CommandProcessor(private val context: Context) {
         )
         private val CREATOR_QUESTIONS = setOf(
             "who created you", "who made you", "who built you", "who developed you", "who designed you",
-            "who is your creator", "who is your developer", "who is your maker", "who created astra",
+     "who is your creator", "who is your developer", "who is your maker", "who created astra",
             "who made astra", "who built astra", "who developed astra", "tumhe kisne banaya",
             "tumhe kisne banaya hai", "aapko kisne banaya", "kisne banaya"
         )
@@ -651,6 +898,117 @@ class CommandProcessor(private val context: Context) {
         )
 
         private val STOP_WORDS = setOf("stop listening", "ruk jao", "so jao")
+        private val HUSH_WORDS = setOf(
+            "stop", "quiet", "quite", "be quiet", "shut up", "silence", "stop talking", "stop speaking",
+            "enough", "chup", "chup ho jao", "chup raho", "bas", "bas karo", "बस", "चुप", "चुप हो जाओ"
+        )
+        private val USE_BT_MIC_WORDS = setOf(
+            "use earbud mic", "use earbuds mic", "use earbud microphone", "use bluetooth mic",
+            "use bluetooth microphone", "use headset mic", "earbud mic on"
+        )
+        private val USE_PHONE_MIC_WORDS = setOf(
+            "use phone mic", "use phone microphone", "use mobile mic", "phone mic", "use the phone mic"
+        )
+
+        private val MEDIA_NEXT = setOf(
+            "next", "next song", "next track", "skip", "skip song", "skip this song", "play next",
+            "play next song", "play the next song", "agla gana", "next gana", "agla song"
+        )
+        private val MEDIA_PREVIOUS = setOf(
+            "previous", "previous song", "previous track", "play previous", "play previous song",
+            "play the previous song", "pichla gana", "previous gana", "go to previous song"
+        )
+        private val MEDIA_PAUSE = setOf(
+            "pause", "pause music", "pause the music", "pause song", "pause the song", "music pause",
+            "music pause karo", "pause karo", "gana pause karo"
+        )
+        private val MEDIA_STOP = setOf(
+            "stop music", "stop the music", "stop song", "stop the song", "stop playing", "music stop",
+            "music band karo", "gana band karo", "stop playback"
+        )
+        private val MEDIA_PLAY = setOf(
+            "play", "resume", "resume music", "resume the music", "play music", "play the music",
+            "play song", "play a song", "continue", "continue music", "continue playing", "music chalao",
+            "gana chalao", "music play karo", "gana play karo"
+        )
+        private val OPEN_AND_PLAY = Regex(
+            "^(?:open|launch|start)\\s+(.+?)\\s+and\\s+play\\s+(.+)$", RegexOption.IGNORE_CASE
+        )
+        private val PLAY_ON = Regex(
+            "^play\\s+(.+?)\\s+(?:on|in|using|with|par)\\s+(.+)$", RegexOption.IGNORE_CASE
+        )
+
+        private val UP_WORDS = listOf(
+            "increase", "raise", "up", "higher", "louder", "more", "badhao", "badha", "badhaao",
+            "zyada", "jyada", "बढ़ाओ", "बढ़ा", "ज्यादा", "तेज"
+        )
+        private val DOWN_WORDS = listOf(
+            "decrease", "reduce", "lower", "down", "softer", "quieter", "less", "dim", "ghatao",
+            "ghata", "kam", "कम", "घटाओ", "घटा", "धीमा"
+        )
+        private val NUMBER = Regex("(\\d{1,3})")
+        private val BY_NUMBER = Regex("\\bby\\s+(\\d{1,3})")
+
+        private val ON_REGEX = Regex(
+            "\\b(on|enable|enabled|activate|start|chalu|shuru)\\b", RegexOption.IGNORE_CASE
+        )
+        private val OFF_REGEX = Regex(
+            "\\b(off|disable|disabled|deactivate|band|stop)\\b", RegexOption.IGNORE_CASE
+        )
+
+        private val TARGETS = listOf(
+            ToggleTarget(
+                "airplane", "airplane mode",
+                listOf("airplane mode", "aeroplane mode", "flight mode", "airplane", "aeroplane", "flight"),
+                listOf("airplane mode", "flight mode", "aeroplane mode")
+            ),
+            ToggleTarget(
+                "bluetooth", "Bluetooth",
+                listOf("bluetooth", "blue tooth"),
+                listOf("bluetooth")
+            ),
+            ToggleTarget(
+                "wifi", "Wi-Fi",
+                listOf("wi-fi", "wifi", "wi fi"),
+                listOf("wi-fi", "wifi", "internet")
+            ),
+            ToggleTarget(
+                "hotspot", "hotspot",
+                listOf("hotspot", "hot spot", "tethering"),
+                listOf("hotspot", "mobile hotspot")
+            ),
+            ToggleTarget(
+                "data", "mobile data",
+                listOf("mobile data", "cellular data", "internet data", "data"),
+                listOf("mobile data", "cellular data", "internet")
+            ),
+            ToggleTarget(
+                "location", "location",
+                listOf("location", "gps"),
+                listOf("location", "gps")
+            ),
+            ToggleTarget(
+                "dnd", "Do Not Disturb",
+                listOf("do not disturb", "don't disturb", "dnd"),
+                listOf("do not disturb", "dnd")
+            ),
+            ToggleTarget(
+                "rotate", "auto rotate",
+                listOf("auto rotate", "auto-rotate", "rotation", "screen rotate"),
+                listOf("auto-rotate", "auto rotate", "rotation")
+            ),
+            ToggleTarget(
+                "battery_saver", "battery saver",
+                listOf("battery saver", "power saving", "power saver", "battery saving"),
+                listOf("battery saver", "power saving", "power saver")
+            ),
+            ToggleTarget(
+                "torch", "flashlight",
+                listOf("flashlight", "flash light", "torch"),
+                listOf("flashlight", "torch")
+            )
+        )
+
         private val BACK_WORDS = setOf("back", "go back", "press back", "previous screen", "peeche jao", "पीछे जाओ")
         private val HOME_WORDS = setOf(
             "home", "go home", "go to home", "home screen", "go to home screen", "press home", "ghar jao", "होम", "होम स्क्रीन"
