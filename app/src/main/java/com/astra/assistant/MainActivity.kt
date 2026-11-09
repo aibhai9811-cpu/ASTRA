@@ -144,6 +144,7 @@ class MainActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= 33) {
             wanted.add(Manifest.permission.POST_NOTIFICATIONS)
         }
+        
         val missing = wanted.filter { !hasPermission(it) }
         if (missing.isNotEmpty() && (!askedPermissions || !hasPermission(Manifest.permission.RECORD_AUDIO))) {
             askedPermissions = true
@@ -152,7 +153,9 @@ class MainActivity : ComponentActivity() {
         }
         startListenService()
     }
-
+        if (Build.VERSION.SDK_INT >= 31) {
+            wanted.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
     private fun startListenService() {
         ListenService.start(this)
         if (!AstraAccessibilityService.isEnabled()) {
