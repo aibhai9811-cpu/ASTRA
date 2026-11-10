@@ -2,9 +2,12 @@ package com.astra.assistant.voice
 
 import android.content.Context
 import android.content.Intent
+import android.media.AudioAttributes
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -21,7 +24,8 @@ class VoiceManager(
     private val onStateChange: (Boolean) -> Unit = {},
     private val onEndOfSpeech: () -> Unit = {},
     private val onError: (String) -> Unit = {},
-    private val onListeningStarted: () -> Unit = {}
+    private val onListeningStarted: () -> Unit = {},
+    private val onAvailabilityChanged: (Boolean) -> Unit = {}
 ) {
     // Aliases. Inside the RecognitionListener object, a call like onRmsChanged(x)
     // would call the listener's own method (endless loop = crash), so we use these.
@@ -32,46 +36,84 @@ class VoiceManager(
     private val errorCallback: (String) -> Unit = onError
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var speechRecognizer: SpeechRecognizer? = null
+    private var recognizer: SpeechRecognizer? = null
     private var textToSpeech: TextToSpeech? = null
     private var ttsReady = false
     private var isSpeakingNow = false
     private var isShutDown = false
-    private var consecutiveErrors = 0
 
-    var recognitionLanguage: String = "en-IN"
-    var preferOnDevice: Boolean = false
+    private var desired = false
+    private var suspended = false
+    private var sessionActive = false
+    private var expectCancel = false
+    private var failures = 0
+    private var busyCount = 0
+    private var available = true
+    private var lastNoticeAt = 0L
+    private var lastFinal = ""
+    private var lastFinalAt = 0L
+    private var lastActivityAt = 0L
+    private var preferOnDeviceValue = false
+
+    // "auto", or a language tag such as "en-IN" or "hi-IN"
+    var recognitionLanguage: String = "auto"
+
+    var preferOnDevice: Boolean
+        get() = preferOnDeviceValue
+        set(value) {
+            if (value != preferOnDeviceValue) {
+                preferOnDeviceValue = value
+                recreateRecognizer()
+            }
+        }
+
     var speechRate: Float = 1.0f
     var speechPitch: Float = 0.95f
 
-    // When true the microphone stays on while ASTRA talks, so "ASTRA stop" can interrupt it.
+    // When true the microphone stays on while ASTRA talks, so a stop phrase can interrupt it.
     var allowBargeIn: Boolean = true
 
     val isSpeaking: Boolean
         get() = isSpeakingNow
 
-    var continuousMode: Boolean = false
+    var continuousMode: Boolean
+        get() = desired
         set(value) {
-            field = value
+            desired = value
             if (!value) {
-                mainHandler.removeCallbacks(restartRunnable)
+                mainHandler.removeCallbacks(beginRunnable)
+                mainHandler.removeCallbacks(watchdog)
+                cancelSession()
             }
         }
 
-    private val restartRunnable = Runnable {
-        if (continuousMode && (!isSpeakingNow || allowBargeIn) && !isShutDown) {
-            startListening()
+    private val beginRunnable = Runnable { beginSession() }
+
+    // Restarts the recognizer if it silently stops reporting anything.
+    private val watchdog = object : Runnable {
+        override fun run() {
+            if (isShutDown || !desired) return
+            if (!suspended && sessionActive && SystemClock.elapsedRealtime() - lastActivityAt > 20_000L) {
+                Log.w(TAG, "Recognizer stalled, recreating it")
+                recreateRecognizer()
+            }
+            mainHandler.postDelayed(this, 10_000L)
         }
     }
 
     private val listener = object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) {}
+        override fun onReadyForSpeech(params: Bundle?) {
+            lastActivityAt = SystemClock.elapsedRealtime()
+            setAvailable(true)
+        }
 
         override fun onBeginningOfSpeech() {
-            consecutiveErrors = 0
+            lastActivityAt = SystemClock.elapsedRealtime()
+            failures = 0
         }
 
         override fun onRmsChanged(rmsdB: Float) {
+            lastActivityAt = SystemClock.elapsedRealtime()
             rmsCallback(rmsdB)
         }
 
@@ -82,23 +124,32 @@ class VoiceManager(
         }
 
         override fun onError(error: Int) {
-            handleRecognitionError(error)
+            sessionActive = false
+            handleError(error)
         }
 
         override fun onResults(results: Bundle?) {
-            val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            if (!matches.isNullOrEmpty()) {
-                consecutiveErrors = 0
-                recognizedCallback(matches[0])
+            sessionActive = false
+            failures = 0
+            busyCount = 0
+            setAvailable(true)
+            val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                ?.firstOrNull()?.trim().orEmpty()
+            val now = SystemClock.elapsedRealtime()
+            // Duplicate protection: the same sentence twice within 1.5 seconds is one command.
+            if (text.isNotEmpty() && !(text == lastFinal && now - lastFinalAt < 1500L)) {
+                lastFinal = text
+                lastFinalAt = now
+                recognizedCallback(text)
             }
-            scheduleRestart(600)
+            scheduleBegin(200)
         }
 
         override fun onPartialResults(partialResults: Bundle?) {
-            val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            if (!matches.isNullOrEmpty()) {
-                partialCallback(matches[0])
-            }
+            lastActivityAt = SystemClock.elapsedRealtime()
+            val text = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                ?.firstOrNull()
+            if (!text.isNullOrEmpty()) partialCallback(text)
         }
 
         override fun onEvent(eventType: Int, params: Bundle?) {}
@@ -108,11 +159,218 @@ class VoiceManager(
         initTts()
     }
 
+    // ---------------- recognition ----------------
+
+    private fun setAvailable(value: Boolean) {
+        if (available != value) {
+            available = value
+            onAvailabilityChanged(value)
+        }
+    }
+
+    private fun scheduleBegin(delayMs: Long) {
+        if (isShutDown || !desired) return
+        mainHandler.removeCallbacks(beginRunnable)
+        mainHandler.postDelayed(beginRunnable, delayMs)
+    }
+
+    private fun createRecognizer(): SpeechRecognizer? {
+        return try {
+            val rec = if (Build.VERSION.SDK_INT >= 31 && preferOnDeviceValue &&
+                SpeechRecognizer.isOnDeviceRecognitionAvailable(context)
+            ) {
+                SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
+            } else {
+                SpeechRecognizer.createSpeechRecognizer(context)
+            }
+            rec.setRecognitionListener(listener)
+            recognizer = rec
+            rec
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not create the recognizer", e)
+            null
+        }
+    }
+
+    private fun destroyRecognizer() {
+        sessionActive = false
+        expectCancel = false
+        val rec = recognizer
+        recognizer = null
+        try {
+            rec?.destroy()
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not destroy the recognizer", e)
+        }
+    }
+
+    private fun recreateRecognizer() {
+        mainHandler.removeCallbacks(beginRunnable)
+        destroyRecognizer()
+        if (desired && !suspended) scheduleBegin(300)
+    }
+
+    private fun cancelSession() {
+        if (!sessionActive) return
+        sessionActive = false
+        expectCancel = true
+        try {
+            recognizer?.cancel()
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not cancel the session", e)
+        }
+        mainHandler.postDelayed({ expectCancel = false }, 600)
+    }
+
+    private fun buildIntent(): Intent {
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+        intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+        intent.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, preferOnDeviceValue)
+        intent.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
+        // Hints that ask for longer silence before a session ends. Google's service may ignore them.
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2500L)
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 2500L)
+        if (recognitionLanguage == "auto") {
+            intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
+            intent.putExtra("android.speech.extra.ADDITIONAL_LANGUAGES", arrayOf("hi-IN"))
+        } else {
+            intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, recognitionLanguage)
+        }
+        return intent
+    }
+
+    private fun beginSession() {
+        if (isShutDown || !desired || suspended || sessionActive) return
+        if (!SpeechRecognizer.isRecognitionAvailable(context)) {
+            setAvailable(false)
+            notifyOnce("Speech recognition is not available. Check that Google speech services are enabled.")
+            scheduleBegin(15_000L)
+            return
+        }
+        val rec = recognizer ?: createRecognizer()
+        if (rec == null) {
+            failures++
+            scheduleBegin(backoff())
+            return
+        }
+        try {
+            lastActivityAt = SystemClock.elapsedRealtime()
+            sessionActive = true
+            rec.startListening(buildIntent())
+        } catch (e: Exception) {
+            Log.w(TAG, "startListening failed", e)
+            sessionActive = false
+            failures++
+            destroyRecognizer()
+            scheduleBegin(backoff())
+        }
+    }
+
+    private fun backoff(): Long {
+        val step = minOf(failures, 5)
+        return minOf(15_000L, 500L * (1 shl step))
+    }
+
+    private fun notifyOnce(message: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastNoticeAt > 60_000L) {
+            lastNoticeAt = now
+            errorCallback(message)
+        }
+    }
+
+    private fun handleError(error: Int) {
+        if (expectCancel && error == SpeechRecognizer.ERROR_CLIENT) {
+            expectCancel = false
+            return
+        }
+        when (error) {
+            SpeechRecognizer.ERROR_NO_MATCH,
+            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
+                failures = 0
+                busyCount = 0
+                scheduleBegin(250)
+            }
+            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> {
+                busyCount++
+                try {
+                    recognizer?.cancel()
+                } catch (e: Exception) {
+                    Log.w(TAG, "cancel on busy failed", e)
+                }
+                if (busyCount >= 3) {
+                    busyCount = 0
+                    destroyRecognizer()
+                }
+                scheduleBegin(800)
+            }
+            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
+                desired = false
+                setAvailable(false)
+                errorCallback("Microphone permission is missing.")
+            }
+            else -> {
+                failures++
+                if (failures >= 3) destroyRecognizer()
+                if (failures >= 5) {
+                    setAvailable(false)
+                    notifyOnce("Speech recognition keeps failing (code $error). I will keep trying.")
+                }
+                scheduleBegin(backoff())
+            }
+        }
+    }
+
+    // ---------------- public control ----------------
+
+    fun startListening() {
+        if (isShutDown) return
+        desired = true
+        suspended = false
+        mainHandler.removeCallbacks(watchdog)
+        mainHandler.postDelayed(watchdog, 10_000L)
+        beginSession()
+        onListeningStarted()
+    }
+
+    fun stopListening() {
+        continuousMode = false
+    }
+
+    // Used while a phone call is ringing or active. The user's ON choice is kept.
+    fun suspendListening() {
+        suspended = true
+        mainHandler.removeCallbacks(beginRunnable)
+        cancelSession()
+    }
+
+    fun resumeListening() {
+        suspended = false
+        if (desired) scheduleBegin(500)
+    }
+
+    // Starts one fresh session, for example after the microphone route changed.
+    fun restartSession() {
+        if (!desired || suspended) return
+        cancelSession()
+        scheduleBegin(400)
+    }
+
+    // ---------------- speech ----------------
+
     private fun initTts() {
         textToSpeech = TextToSpeech(context) { status ->
             if (status == TextToSpeech.SUCCESS) {
                 ttsReady = true
                 textToSpeech?.language = Locale("en", "IN")
+                textToSpeech?.setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
                 textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) {
                         mainHandler.post { onStateChange(true) }
@@ -137,92 +395,25 @@ class VoiceManager(
         mainHandler.post {
             isSpeakingNow = false
             onStateChange(false)
-            scheduleRestart(400)
+            if (!allowBargeIn) scheduleBegin(400)
         }
-    }
-
-    private fun scheduleRestart(delayMs: Long) {
-        if (!continuousMode || isShutDown) return
-        mainHandler.removeCallbacks(restartRunnable)
-        mainHandler.postDelayed(restartRunnable, delayMs)
-    }
-
-    private fun handleRecognitionError(error: Int) {
-        when (error) {
-            SpeechRecognizer.ERROR_NO_MATCH,
-            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
-                if (continuousMode) {
-                    scheduleRestart(300)
-                } else {
-                    errorCallback("I did not catch that. Tap the mic and try again.")
-                }
-            }
-            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
-                continuousMode = false
-                errorCallback("Microphone permission is missing.")
-            }
-            else -> {
-                consecutiveErrors++
-                if (continuousMode && consecutiveErrors <= 5) {
-                    scheduleRestart(1500)
-                } else {
-                    continuousMode = false
-                    errorCallback("Speech recognition error (code $error). Tap the mic to try again.")
-                }
-            }
-        }
-    }
-
-    fun startListening() {
-        if (isShutDown) return
-        if (!SpeechRecognizer.isRecognitionAvailable(context)) {
-            continuousMode = false
-            errorCallback("Speech recognition is not available. Check that Google speech services are enabled.")
-            return
-        }
-        mainHandler.removeCallbacks(restartRunnable)
-        try {
-            speechRecognizer?.destroy()
-        } catch (e: Exception) {
-            Log.w(TAG, "Could not destroy previous recognizer", e)
-        }
-        val recognizer = SpeechRecognizer.createSpeechRecognizer(context)
-        speechRecognizer = recognizer
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(
-                RecognizerIntent.EXTRA_LANGUAGE,
-                if (recognitionLanguage == "hinglish") "en-IN" else recognitionLanguage
-            )
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, preferOnDevice)
-        }
-        recognizer.setRecognitionListener(listener)
-        recognizer.startListening(intent)
-        onListeningStarted()
-    }
-
-    fun stopListening() {
-        continuousMode = false
-        mainHandler.removeCallbacks(restartRunnable)
-        speechRecognizer?.cancel()
     }
 
     fun speak(text: String) {
         if (!ttsReady) {
             onStateChange(false)
-            scheduleRestart(300)
             return
         }
         isSpeakingNow = true
         if (!allowBargeIn) {
-            mainHandler.removeCallbacks(restartRunnable)
-            speechRecognizer?.cancel()
+            mainHandler.removeCallbacks(beginRunnable)
+            cancelSession()
         }
         val hasDevanagari = text.any { it in '\u0900'..'\u097F' }
         textToSpeech?.language = if (hasDevanagari) Locale("hi", "IN") else Locale("en", "IN")
         textToSpeech?.setSpeechRate(speechRate)
         textToSpeech?.setPitch(speechPitch)
+        // QUEUE_FLUSH clears anything still waiting to be spoken.
         textToSpeech?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "ASTRA_TTS")
     }
 
@@ -230,17 +421,14 @@ class VoiceManager(
         textToSpeech?.stop()
         isSpeakingNow = false
         onStateChange(false)
-        scheduleRestart(300)
+        if (!allowBargeIn) scheduleBegin(300)
     }
 
     fun shutdown() {
         isShutDown = true
-        mainHandler.removeCallbacks(restartRunnable)
-        try {
-            speechRecognizer?.destroy()
-        } catch (e: Exception) {
-            Log.w(TAG, "Could not destroy recognizer", e)
-        }
+        desired = false
+        mainHandler.removeCallbacksAndMessages(null)
+        destroyRecognizer()
         textToSpeech?.stop()
         textToSpeech?.shutdown()
     }
