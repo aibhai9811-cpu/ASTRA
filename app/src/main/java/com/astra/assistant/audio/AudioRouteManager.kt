@@ -8,43 +8,41 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import com.astra.assistant.voice.VoiceSettings
 
-// Sends the microphone input to Bluetooth earbuds when they are connected.
-class AudioRouteManager(context: Context, private val onRouteChanged: () -> Unit) {
+// Asks Android to use Bluetooth earbuds for the microphone. This is a request: Google's speech
+// service decides the final input, and Android does not report which device it used.
+class AudioRouteManager(context: Context, private val onDevicesChanged: () -> Unit) {
 
-    private val appContext = context.applicationContext
-    private val audio = appContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    data class Route(val usingBluetooth: Boolean, val description: String)
+
+    private val audio = context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private val handler = Handler(Looper.getMainLooper())
-    private var routedToBluetooth = false
     private var registered = false
+    private var routedBluetooth = false
+    private var routedName = ""
 
-    private val debounce = Runnable {
-        val before = routedToBluetooth
-        applyRoute()
-        if (routedToBluetooth != before) onRouteChanged()
-    }
+    private val notifyChanged = Runnable { onDevicesChanged() }
 
     private val callback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
-            scheduleReapply()
+            schedule()
         }
 
         override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
-            scheduleReapply()
+            schedule()
         }
     }
 
-    private fun scheduleReapply() {
-        handler.removeCallbacks(debounce)
-        handler.postDelayed(debounce, 800)
+    private fun schedule() {
+        handler.removeCallbacks(notifyChanged)
+        handler.postDelayed(notifyChanged, 800)
     }
 
     fun start() {
-        if (!registered) {
-            audio.registerAudioDeviceCallback(callback, handler)
-            registered = true
-        }
-        applyRoute()
+        if (registered) return
+        audio.registerAudioDeviceCallback(callback, handler)
+        registered = true
     }
 
     fun stop() {
@@ -52,7 +50,7 @@ class AudioRouteManager(context: Context, private val onRouteChanged: () -> Unit
             audio.unregisterAudioDeviceCallback(callback)
             registered = false
         }
-        handler.removeCallbacks(debounce)
+        handler.removeCallbacks(notifyChanged)
         release()
     }
 
@@ -64,79 +62,100 @@ class AudioRouteManager(context: Context, private val onRouteChanged: () -> Unit
         }
     }
 
-    // Returns a short sentence describing which microphone is in use.
-    fun applyRoute(): String {
-        val wantBluetooth = preferBluetooth(appContext)
-        val input = if (wantBluetooth) bluetoothInput() else null
+    fun hasBluetoothMic(): Boolean = bluetoothInput() != null
+
+    private fun describeBluetooth(): String = "Bluetooth: " + routedName.ifBlank { "earbuds" }
+
+    fun apply(preference: String): Route {
+        if (preference == VoiceSettings.MIC_PHONE) {
+            release()
+            return Route(false, "Phone microphone")
+        }
+        val input = bluetoothInput()
         if (input == null) {
             release()
-            return if (wantBluetooth) {
-                "No Bluetooth microphone is connected, so I am using the phone microphone."
+            val text = if (preference == VoiceSettings.MIC_BLUETOOTH) {
+                "No Bluetooth microphone connected, using the phone microphone"
             } else {
-                "I am using the phone microphone."
+                "Phone microphone"
             }
+            return Route(false, text)
         }
-        if (routedToBluetooth) return "I am using the earbud microphone."
+        val mode = audio.mode
+        if (mode == AudioManager.MODE_RINGTONE || mode == AudioManager.MODE_IN_CALL) {
+            return Route(false, "Phone microphone (call in progress)")
+        }
+        if (routedBluetooth) return Route(true, describeBluetooth())
         return try {
-            routeToBluetooth()
+            startBluetoothRoute(input)
         } catch (e: SecurityException) {
             Log.w(TAG, "Bluetooth routing blocked", e)
-            "Android blocked the earbud microphone. Allow the Nearby devices permission for ASTRA."
+            release()
+            Route(false, "Phone microphone (allow the Nearby devices permission to use earbuds)")
         } catch (e: Exception) {
             Log.w(TAG, "Bluetooth routing failed", e)
-            "I could not switch to the earbud microphone."
+            release()
+            Route(false, "Phone microphone (earbud route failed)")
         }
     }
 
     @Suppress("DEPRECATION")
-    private fun routeToBluetooth(): String {
+    private fun startBluetoothRoute(input: AudioDeviceInfo): Route {
+        // Never take over the audio mode while something else (a call, another app) is using it.
+        if (audio.mode != AudioManager.MODE_NORMAL) return Route(false, "Phone microphone (audio busy)")
         if (Build.VERSION.SDK_INT >= 31) {
             val target = audio.availableCommunicationDevices.firstOrNull {
                 it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
-            } ?: return "Your earbuds do not offer a microphone route, so I am using the phone microphone."
+            } ?: return Route(false, "Phone microphone (earbuds offer no microphone)")
+            holdingCommunicationMode = true
             audio.mode = AudioManager.MODE_IN_COMMUNICATION
-            val ok = audio.setCommunicationDevice(target)
-            routedToBluetooth = ok
-            if (!ok) audio.mode = AudioManager.MODE_NORMAL
-            return if (ok) "I am using the earbud microphone." else "Android would not switch to the earbud microphone."
-        }
-        if (audio.isBluetoothScoAvailableOffCall) {
+            if (!audio.setCommunicationDevice(target)) {
+                release()
+                return Route(false, "Phone microphone (Android refused the earbud route)")
+            }
+            routedName = target.productName?.toString().orEmpty()
+        } else {
+            if (!audio.isBluetoothScoAvailableOffCall) {
+                return Route(false, "Phone microphone (this phone cannot use the earbud microphone)")
+            }
+            holdingCommunicationMode = true
             audio.mode = AudioManager.MODE_IN_COMMUNICATION
             audio.startBluetoothSco()
             audio.isBluetoothScoOn = true
-            routedToBluetooth = true
-            return "I am using the earbud microphone."
+            routedName = input.productName?.toString().orEmpty()
         }
-        return "This phone cannot use the earbud microphone."
+        routedBluetooth = true
+        return Route(true, describeBluetooth())
     }
 
     @Suppress("DEPRECATION")
-    private fun release() {
-        if (!routedToBluetooth) return
-        routedToBluetooth = false
-        try {
-            if (Build.VERSION.SDK_INT >= 31) {
-                audio.clearCommunicationDevice()
-            } else {
-                audio.stopBluetoothSco()
-                audio.isBluetoothScoOn = false
+    fun release() {
+        if (routedBluetooth || holdingCommunicationMode) {
+            try {
+                if (Build.VERSION.SDK_INT >= 31) {
+                    audio.clearCommunicationDevice()
+                } else {
+                    audio.stopBluetoothSco()
+                    audio.isBluetoothScoOn = false
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Bluetooth release failed", e)
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "Bluetooth release failed", e)
+            // Only undo the mode if it is still the one ASTRA set. Never touch a call.
+            if (holdingCommunicationMode && audio.mode == AudioManager.MODE_IN_COMMUNICATION) {
+                audio.mode = AudioManager.MODE_NORMAL
+            }
         }
-        audio.mode = AudioManager.MODE_NORMAL
+        routedBluetooth = false
+        routedName = ""
+        holdingCommunicationMode = false
     }
 
     companion object {
         private const val TAG = "ASTRA_AUDIO"
-        private const val PREFS = "astra_audio"
-        private const val KEY = "prefer_bt_mic"
 
-        fun preferBluetooth(context: Context): Boolean =
-            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY, true)
-
-        fun setPreferBluetooth(context: Context, value: Boolean) {
-            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY, value).apply()
-        }
+        // True only while ASTRA itself holds MODE_IN_COMMUNICATION for the earbud microphone.
+        @Volatile
+        var holdingCommunicationMode: Boolean = false
     }
 }
