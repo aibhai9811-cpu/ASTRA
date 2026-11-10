@@ -18,6 +18,7 @@ import com.astra.assistant.MainActivity
 import com.astra.assistant.ai.AiOutcome
 import com.astra.assistant.ai.AstraAi
 import com.astra.assistant.audio.AudioRouteManager
+import com.astra.assistant.audio.CallStateMonitor
 import com.astra.assistant.commands.CommandExecutionResult
 import com.astra.assistant.commands.CommandProcessor
 import com.astra.assistant.data.AstraDatabase
@@ -26,6 +27,7 @@ import com.astra.assistant.model.AssistantState
 import com.astra.assistant.model.PendingAction
 import com.astra.assistant.network.ResearchService
 import com.astra.assistant.voice.VoiceManager
+import com.astra.assistant.voice.VoiceSettings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -40,41 +42,63 @@ class ListenService : Service() {
     private var processor: CommandProcessor? = null
     private var memoryRepository: AstraMemoryRepository? = null
     private var audioRoute: AudioRouteManager? = null
+    private var callMonitor: CallStateMonitor? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var wakeLock: PowerManager.WakeLock? = null
     private var followUpUntil = 0L
     private var shownSetupHint = false
     private var lastSpoken: String? = null
     private var speechEndedAt = 0L
+    private var callPaused = false
+    private var recognitionUnavailable = false
+    private var endAfterReply = false
+    private var lastStatusText = ""
+    private var currentRoute = AudioRouteManager.Route(false, "Phone microphone")
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
+        when (intent?.action) {
+            ACTION_STOP -> {
+                turnOffByUser()
+                return START_NOT_STICKY
+            }
+            ACTION_HUSH -> {
+                voice?.stopSpeaking()
+                return START_STICKY
+            }
+        }
+        // Restarted by Android after a kill: only continue if the user's switch is still ON.
+        if (intent == null && !VoiceSettings.listeningOn(this)) {
             stopSelf()
             return START_NOT_STICKY
         }
-        if (intent?.action == ACTION_HUSH) {
-            voice?.stopSpeaking()
-            return START_STICKY
-        }
+        VoiceSettings.setListeningOn(this, true)
         if (!enterForeground()) {
             AssistantBridge.notices.tryEmit("Could not start background listening. Open ASTRA and tap the mic again.")
+            VoiceSettings.setListeningOn(this, false)
             stopSelf()
             return START_NOT_STICKY
         }
         if (voice == null) setUp()
-        voice?.continuousMode = true
-        voice?.startListening()
+        applySettings()
         AssistantBridge.active.value = true
+        val engine = voice
+        engine?.continuousMode = true
+        if (!callPaused) {
+            applyRoute(false)
+            engine?.startListening()
+        }
+        updateStatus()
         return START_STICKY
     }
 
-    private fun enterForeground(): Boolean {
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        manager.createNotificationChannel(
-            NotificationChannel(CHANNEL_ID, "ASTRA listening", NotificationManager.IMPORTANCE_LOW)
-        )
+    // ---------------- notification ----------------
+
+    private fun notificationManager(): NotificationManager =
+        getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+    private fun buildNotification(text: String): Notification {
         val openIntent = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
@@ -90,12 +114,13 @@ class ListenService : Service() {
             Intent(this, ListenService::class.java).setAction(ACTION_HUSH),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val notification = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("ASTRA is listening")
-            .setContentText("Say \"ASTRA\" and then your command")
+        return Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("ASTRA microphone is on")
+            .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(openIntent)
             .setOngoing(true)
+            .setOnlyAlertOnce(true)
             .addAction(
                 Notification.Action.Builder(
                     Icon.createWithResource(this, android.R.drawable.ic_lock_silent_mode),
@@ -106,11 +131,18 @@ class ListenService : Service() {
             .addAction(
                 Notification.Action.Builder(
                     Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
-                    "Stop",
+                    "Turn off",
                     stopIntent
                 ).build()
             )
             .build()
+    }
+
+    private fun enterForeground(): Boolean {
+        notificationManager().createNotificationChannel(
+            NotificationChannel(CHANNEL_ID, "ASTRA listening", NotificationManager.IMPORTANCE_LOW)
+        )
+        val notification = buildNotification(lastStatusText.ifBlank { "Starting..." })
         return try {
             if (Build.VERSION.SDK_INT >= 29) {
                 startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
@@ -124,6 +156,28 @@ class ListenService : Service() {
         }
     }
 
+    // Updates the existing notification and the app's microphone state. Only changes when the status changes.
+    private fun updateStatus() {
+        val status = when {
+            callPaused -> MicStatus.PAUSED_FOR_CALL
+            recognitionUnavailable -> MicStatus.UNAVAILABLE
+            else -> MicStatus.LISTENING
+        }
+        AssistantBridge.micStatus.value = status
+        AssistantBridge.inputDevice.value = currentRoute.description
+        val text = when (status) {
+            MicStatus.PAUSED_FOR_CALL -> "Paused for a phone call. I will resume afterwards."
+            MicStatus.UNAVAILABLE -> "Speech recognition is unavailable. Retrying..."
+            else -> "Listening. ${currentRoute.description}. Say ASTRA and a command."
+        }
+        if (text != lastStatusText) {
+            lastStatusText = text
+            notificationManager().notify(NOTIFICATION_ID, buildNotification(text))
+        }
+    }
+
+    // ---------------- setup and lifecycle ----------------
+
     private fun setUp() {
         processor = CommandProcessor(applicationContext)
         memoryRepository = AstraMemoryRepository(AstraDatabase.getDatabase(applicationContext, scope).memoryDao())
@@ -135,53 +189,111 @@ class ListenService : Service() {
         voice = VoiceManager(
             context = applicationContext,
             onSpeechRecognized = { text -> handleSpeech(text) },
-            onPartialSpeech = { text ->
-                if (voice?.isSpeaking == true) {
-                    if (isHushPhrase(text)) hush()
-                } else {
-                    AssistantBridge.partial.value = text
-                }
-            },
-            onStateChange = { speaking ->
-                if (speaking) {
-                    AssistantBridge.phase.value = AssistantState.SPEAKING
-                } else {
-                    speechEndedAt = SystemClock.elapsedRealtime()
-                    AssistantBridge.phase.value = AssistantState.LISTENING
-                }
-            },
-            onEndOfSpeech = {
-                if (voice?.isSpeaking != true) AssistantBridge.phase.value = AssistantState.PROCESSING
-            },
-            onError = { message ->
-                AssistantBridge.notices.tryEmit(message)
-                if (voice?.continuousMode != true) stopSelf()
-            },
-            onListeningStarted = {
-                if (voice?.isSpeaking != true) {
-                    AssistantBridge.partial.value = ""
-                    AssistantBridge.phase.value = AssistantState.LISTENING
-                }
+            onPartialSpeech = { text -> onPartial(text) },
+            onStateChange = { speaking -> onSpeakingChanged(speaking) },
+            onError = { message -> AssistantBridge.notices.tryEmit(message) },
+            onAvailabilityChanged = { available ->
+                recognitionUnavailable = !available
+                updateStatus()
             }
         )
-        audioRoute = AudioRouteManager(applicationContext) { handleRouteChanged() }
+        audioRoute = AudioRouteManager(applicationContext) { onAudioDevicesChanged() }
         audioRoute?.start()
+        callMonitor = CallStateMonitor(applicationContext) { inCall -> onCallChanged(inCall) }
+        callMonitor?.start()
         scope.launch {
-            AssistantBridge.asyncReplies.collect { text -> replyAsync(text) }
+            AssistantBridge.asyncReplies.collect { text -> reply("(phone control)", text) }
         }
     }
 
-    private fun handleRouteChanged() {
+    private fun applySettings() {
         val engine = voice ?: return
-        if (engine.continuousMode) engine.startListening()
+        engine.recognitionLanguage = when (VoiceSettings.language(this)) {
+            VoiceSettings.LANG_HI -> "hi-IN"
+            VoiceSettings.LANG_EN -> "en-IN"
+            else -> "auto"
+        }
+        engine.preferOnDevice = VoiceSettings.onDevice(this)
+        engine.allowBargeIn = true
     }
+
+    private fun applyRoute(restartIfChanged: Boolean) {
+        val manager = audioRoute ?: return
+        val before = currentRoute
+        val after = manager.apply(VoiceSettings.micPreference(this))
+        currentRoute = after
+        if (restartIfChanged && before.usingBluetooth != after.usingBluetooth) {
+            voice?.restartSession()
+        }
+    }
+
+    private fun onAudioDevicesChanged() {
+        if (callPaused) return
+        applyRoute(true)
+        updateStatus()
+    }
+
+    private fun onCallChanged(inCall: Boolean) {
+        callPaused = inCall
+        if (inCall) {
+            voice?.suspendListening()
+            voice?.stopSpeaking()
+            audioRoute?.release()
+            AssistantBridge.partial.value = ""
+            AssistantBridge.phase.value = AssistantState.IDLE
+        } else {
+            applyRoute(false)
+            voice?.resumeListening()
+            AssistantBridge.phase.value = AssistantState.LISTENING
+        }
+        updateStatus()
+    }
+
+    private fun onPartial(text: String) {
+        if (voice?.isSpeaking == true) {
+            if (isHushPhrase(text)) hush()
+        } else {
+            AssistantBridge.partial.value = text
+        }
+    }
+
+    private fun onSpeakingChanged(speaking: Boolean) {
+        if (speaking) {
+            AssistantBridge.phase.value = AssistantState.SPEAKING
+        } else {
+            speechEndedAt = SystemClock.elapsedRealtime()
+            AssistantBridge.phase.value = if (callPaused) AssistantState.IDLE else AssistantState.LISTENING
+            if (endAfterReply) finishSingleShot()
+        }
+    }
+
+    private fun turnOffByUser() {
+        VoiceSettings.setListeningOn(this, false)
+        voice?.continuousMode = false
+        stopSelf()
+    }
+
+    private fun finishSingleShot() {
+        // Keep listening if ASTRA is waiting for a yes or no.
+        if (ConfirmationManager.peek() != null) {
+            endAfterReply = false
+            return
+        }
+        endAfterReply = false
+        turnOffByUser()
+    }
+
+    // ---------------- stop speaking ----------------
 
     private fun normalize(raw: String): String =
         raw.lowercase(Locale.ROOT).replace(NOISE, " ").replace(SPACES, " ").trim()
 
     private fun isHushPhrase(raw: String): Boolean {
-        val base = WakeWord.strip(raw) ?: raw
-        return normalize(base) in HUSH_PHRASES
+        val withoutWake = WakeWord.strip(raw) ?: raw
+        val n = normalize(withoutWake).removeSuffix(" astra").removeSuffix(" अस्त्र").trim()
+        if (n.isEmpty()) return false
+        if (n in HUSH_PHRASES) return true
+        return n.split(" ").size <= 5 && HUSH_CONTAINS.any { n.contains(it) }
     }
 
     private fun hush() {
@@ -200,9 +312,12 @@ class ListenService : Service() {
         return words.count { it in spokenWords } >= words.size * 0.8
     }
 
+    // ---------------- speech handling ----------------
+
     private fun handleSpeech(raw: String) {
         val text = raw.trim()
-        if (text.isEmpty()) return
+        if (text.isEmpty() || callPaused) return
+        applySettings()
         val now = SystemClock.elapsedRealtime()
 
         // 0. While ASTRA talks only a stop phrase is accepted. Anything else is probably its own voice.
@@ -214,7 +329,7 @@ class ListenService : Service() {
 
         val stripped = WakeWord.strip(text)
 
-        // 1. Confirmation has the highest priority and never reaches Gemini.
+        // 1. A pending yes or no has the highest priority and never reaches Gemini.
         if (ConfirmationManager.peek() != null) {
             when (ConfirmationManager.interpret(text)) {
                 ConfirmationManager.Answer.YES -> {
@@ -241,7 +356,10 @@ class ListenService : Service() {
             }
         }
 
-        // 2. The wake word is required when ASTRA is not on screen.
+        // 2. A stop phrase with nothing to stop is ignored. It is never sent to Gemini or the command engine.
+        if (isHushPhrase(text)) return
+
+        // 3. The wake word is required when ASTRA is not on screen.
         var command = text
         if (!AssistantBridge.appVisible) {
             if (stripped == null) {
@@ -259,13 +377,35 @@ class ListenService : Service() {
         }
         followUpUntil = 0L
 
-        // 3. A bare yes or no with nothing waiting is not a question for Gemini.
+        // 4. A bare yes or no with nothing waiting is not a question for Gemini.
         if (ConfirmationManager.isBareAnswer(command) && !AstraAi.hasRecentConversation()) {
             reply(text, "There is nothing waiting for confirmation.")
             return
         }
+
+        // 5. Microphone questions and choices
+        val norm = normalize(command)
+        if (norm in WHICH_MIC) {
+            reply(text, describeRoute())
+            return
+        }
+        if (norm in AUTO_MIC) {
+            VoiceSettings.setMicPreference(this, VoiceSettings.MIC_AUTO)
+            applyRoute(true)
+            updateStatus()
+            reply(text, "Okay, I will pick the microphone automatically. ${describeRoute()}")
+            return
+        }
         runCommand(command)
     }
+
+    private fun describeRoute(): String =
+        if (currentRoute.usingBluetooth) {
+            "I asked Android to use your earbud microphone. ${currentRoute.description}. " +
+                "Google's speech service makes the final choice, so if I mishear you, say use phone mic."
+        } else {
+            "${currentRoute.description}."
+        }
 
     private fun confirmAction(userText: String, action: PendingAction) {
         val engine = processor
@@ -307,22 +447,23 @@ class ListenService : Service() {
         when (result) {
             is CommandExecutionResult.Handled -> {
                 if (result.actionType == "HUSH") {
-                    voice?.stopSpeaking()
-                    AssistantBridge.phase.value = AssistantState.LISTENING
+                    hush()
                     return
                 }
                 if (result.actionType == "USE_BT_MIC" || result.actionType == "USE_PHONE_MIC") {
-                    AudioRouteManager.setPreferBluetooth(applicationContext, result.actionType == "USE_BT_MIC")
-                    val status = audioRoute?.applyRoute().orEmpty()
-                    handleRouteChanged()
-                    reply(userText, "${result.message} $status".trim())
+                    VoiceSettings.setMicPreference(
+                        this,
+                        if (result.actionType == "USE_BT_MIC") VoiceSettings.MIC_BLUETOOTH else VoiceSettings.MIC_PHONE
+                    )
+                    applyRoute(true)
+                    updateStatus()
+                    reply(userText, "${result.message} ${describeRoute()}")
                     return
                 }
                 reply(userText, result.message)
                 if (result.actionType == "STOP_LISTENING") {
-                    voice?.continuousMode = false
                     delay(2500)
-                    stopSelf()
+                    turnOffByUser()
                 }
             }
             is CommandExecutionResult.RequiresConfirmation -> {
@@ -366,15 +507,19 @@ class ListenService : Service() {
 
     private fun reply(userText: String, text: String) {
         lastSpoken = text
-        AssistantBridge.exchanges.tryEmit(AssistantBridge.Exchange(userText, text))
-        voice?.speak(text)
-    }
-
-    private fun replyAsync(text: String) {
-        reply("(phone control)", text)
+        AssistantBridge.exchanges.tryEmit(AssistantBridge.Exchange(userText, text)
+        if (!VoiceSettings.continuous(this)) endAfterReply = true
+        if (VoiceSettings.spokenResponses(this)) {
+            voice?.speak(text)
+        } else {
+            AssistantBridge.phase.value = AssistantState.LISTENING
+            if (endAfterReply) finishSingleShot()
+        }
     }
 
     override fun onDestroy() {
+        callMonitor?.stop()
+        callMonitor = null
         audioRoute?.stop()
         audioRoute = null
         voice?.shutdown()
@@ -385,6 +530,7 @@ class ListenService : Service() {
         AssistantBridge.active.value = false
         AssistantBridge.phase.value = AssistantState.IDLE
         AssistantBridge.partial.value = ""
+        AssistantBridge.micStatus.value = MicStatus.OFF
         super.onDestroy()
     }
 
@@ -400,15 +546,31 @@ class ListenService : Service() {
         private val SPACES = Regex("\\s+")
 
         private val HUSH_PHRASES = setOf(
-            "stop", "quiet", "quite", "be quiet", "shut up", "silence", "stop talking", "stop speaking",
-            "enough", "chup", "chup ho jao", "chup raho", "bas", "bas karo", "बस", "चुप", "चुप हो जाओ"
+            "stop", "quiet", "quite", "silence", "enough", "shut up", "be quiet", "stop speaking",
+            "stop talking", "stop voice", "cancel speech", "chup", "chup ho jao", "chup raho",
+            "bolna band karo", "bas karo", "bas", "ruk jao", "ruk ja", "awaaz band karo", "awaz band karo",
+            "avaaz band karo", "आवाज बंद करो", "चुप हो जाओ", "चुप", "बोलना बंद करो", "बस करो", "बस", "रुक जाओ"
+        )
+        private val HUSH_CONTAINS = listOf(
+            "stop speaking", "stop talking", "stop voice", "cancel speech", "be quiet", "shut up",
+            "bolna band", "awaaz band", "awaz band", "avaaz band", "bas karo", "chup ho", "chup raho",
+            "बोलना बंद", "आवाज बंद", "चुप हो", "बस करो"
+        )
+        private val WHICH_MIC = setOf(
+            "which mic", "which microphone", "which mic are you using", "which microphone are you using",
+            "mic status", "microphone status", "kaun sa mic"
+        )
+        private val AUTO_MIC = setOf(
+            "automatic mic", "use automatic mic", "auto mic", "use auto mic", "mic automatic"
         )
 
         fun start(context: Context) {
             context.startForegroundService(Intent(context, ListenService::class.java))
         }
 
+        // The user's OFF choice is saved first, so nothing restarts the microphone afterwards.
         fun stop(context: Context) {
+            VoiceSettings.setListeningOn(context, false)
             context.stopService(Intent(context, ListenService::class.java))
         }
 
@@ -418,4 +580,4 @@ class ListenService : Service() {
             }
         }
     }
-}
+                                          }
