@@ -5,9 +5,12 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import java.util.Locale
 
+enum class MicStatus { OFF, LISTENING, PAUSED_FOR_CALL, UNAVAILABLE }
+
 object AssistantBridge {
     data class Exchange(val userText: String, val reply: String)
 
+    // true while the user's microphone switch is ON (even while paused for a call)
     val active = MutableStateFlow(false)
     val phase = MutableStateFlow(AssistantState.IDLE)
     val partial = MutableStateFlow("")
@@ -16,6 +19,9 @@ object AssistantBridge {
 
     // Results of actions that finish a moment later, such as tapping Quick Settings tiles.
     val asyncReplies = MutableSharedFlow<String>(extraBufferCapacity = 8)
+
+    val micStatus = MutableStateFlow(MicStatus.OFF)
+    val inputDevice = MutableStateFlow("Phone microphone")
 
     @Volatile
     var appVisible: Boolean = false
