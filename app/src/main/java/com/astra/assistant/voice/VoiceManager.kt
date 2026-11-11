@@ -71,7 +71,7 @@ class VoiceManager(
     var speechPitch: Float = 0.95f
 
     // When true the microphone stays on while ASTRA talks, so a stop phrase can interrupt it.
-    var allowBargeIn: Boolean = true
+    var allowBargeIn: Boolean = false
 
     val isSpeaking: Boolean
         get() = isSpeakingNow
