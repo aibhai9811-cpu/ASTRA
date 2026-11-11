@@ -214,7 +214,7 @@ class ListenService : Service() {
             else -> "auto"
         }
         engine.preferOnDevice = VoiceSettings.onDevice(this)
-        engine.allowBargeIn = true
+        engine.allowBargeIn = currentRoute.usingBluetooth
     }
 
     private fun applyRoute(restartIfChanged: Boolean) {
@@ -305,7 +305,7 @@ class ListenService : Service() {
     private fun looksLikeEcho(text: String): Boolean {
         val spoken = lastSpoken ?: return false
         val now = SystemClock.elapsedRealtime()
-        if (now - speechEndedAt > 8000) return false
+                if (now - speechEndedAt < 1200) return true
         val words = normalize(text).split(" ").filter { it.isNotEmpty() }
         if (words.size < 2) return false
         val spokenWords = normalize(spoken).split(" ").toSet()
