@@ -4,70 +4,246 @@ import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.NoiseSuppressor
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
+import org.json.JSONArray
 import org.json.JSONObject
 import org.vosk.LibVosk
 import org.vosk.LogLevel
 import org.vosk.Model
 import org.vosk.Recognizer
 
-// Offline speech recognition. One microphone session runs until it is stopped, so there are
-// no restarts and no start sounds. All callbacks arrive on the main thread.
+// How the wake word may be heard. The small model does not always spell "astra" the same way.
+object WakeVariants {
+    val STRICT = setOf(
+        "astra", "astro", "aastra", "astraa", "ostra", "austra", "asthra",
+        "अस्त्र", "एस्ट्रा", "अस्ट्रा"
+    )
+    val LOOSE = setOf("extra", "astral", "aster", "estra")
+    private val FILLERS = setOf("hey", "ok", "okay", "hi", "hello")
+
+    private fun isWakeToken(token: String): Boolean = token in STRICT || token in LOOSE
+
+    private fun significant(text: String): List<String> =
+        text.split(" ").filter { it.isNotBlank() && it != "[unk]" }
+
+    fun isWakeFinal(text: String): Boolean {
+        val tokens = significant(text)
+        val head = tokens.dropWhile { it in FILLERS }
+        if (head.isEmpty()) return false
+        val first = head[0]
+        if (first in STRICT) return true
+        if (tokens.size <= 3 && (first in LOOSE || (first == "a" && head.getOrNull(1) == "star"))) return true
+        return false
+    }
+
+    fun isWakePartial(text: String): Boolean {
+        val head = significant(text).dropWhile { it in FILLERS }
+        return head.isNotEmpty() && head[0] in STRICT
+    }
+
+    // Removes a leading wake word (and "hey"/"ok" before it). "hello" alone is left untouched.
+    fun stripLeading(text: String): String {
+        val tokens = text.split(" ").filter { it.isNotBlank() && it != "[unk]" }.toMutableList()
+        var start = 0
+        if (tokens.size >= 2 && tokens[0] in FILLERS && isWakeToken(tokens[1])) start = 1
+        if (start < tokens.size && isWakeToken(tokens[start])) {
+            tokens.subList(0, start + 1).clear()
+        } else if (start == 0 && tokens.size >= 2 && tokens[0] == "a" && tokens[1] == "star") {
+            tokens.subList(0, 2).clear()
+        }
+        return tokens.joinToString(" ")
+    }
+}
+
+// Words that mean "stop talking", used while ASTRA is speaking.
+object StopPhrases {
+    private val SINGLE = setOf(
+        "stop", "quiet", "silence", "enough", "cancel", "chup", "bas",
+        "बस", "चुप", "रुको", "रुक", "स्टॉप", "शांत"
+    )
+    private val KARO = setOf("karo", "kara", "carol", "kar", "care", "करो")
+    private val JAO = setOf("jao", "jow", "raho", "ho", "hojao")
+
+    fun matches(text: String): Boolean {
+        val t = text.split(" ").filter { it.isNotBlank() && it != "[unk]" }
+        if (t.isEmpty() || t.size > 5) return false
+        if (t.any { it in SINGLE }) return true
+        if (t.contains("shut") && t.contains("up")) return true
+        if (t.any { it == "bus" || it == "bass" } && t.any { it in KARO }) return true
+        if (t.any { it == "chop" || it == "chip" } && t.any { it in JAO }) return true
+        if (t.any { it == "ruk" || it == "rook" }) return true
+        if (t.contains("band") && (t.contains("awaaz") || t.contains("awaz") || t.contains("bolna"))) return true
+        return false
+    }
+}
+
+// Offline speech recognition with one microphone session and three modes:
+// WAKE (waiting for "ASTRA"), COMMAND (capturing a command) and SPEAKING (only listening for "stop").
+// All callbacks arrive on the main thread.
 class OfflineRecognizer(
     private val onPartial: (String) -> Unit,
     private val onFinal: (String) -> Unit,
     private val onFailure: (String) -> Unit,
     private val onInput: (String) -> Unit,
-    private val onCaptureStarted: () -> Unit
+    private val onCaptureStarted: () -> Unit,
+    private val onWake: () -> Unit,
+    private val onWindowClosed: () -> Unit,
+    private val onBargeIn: () -> Unit
 ) {
+    class Vocabulary(val wake: List<String>, val stop: List<String>, val command: List<String>) {
+        fun key(): Int = 31 * (31 * wake.hashCode() + stop.hashCode()) + command.hashCode()
+
+        companion object {
+            val EMPTY = Vocabulary(emptyList(), emptyList(), emptyList())
+        }
+    }
+
+    private enum class Mode { WAKE, COMMAND, SPEAKING }
+
     private val main = Handler(Looper.getMainLooper())
     private val lock = Any()
     private var model: Model? = null
-    private var recognizer: Recognizer? = null
+    private var wakeRec: Recognizer? = null
+    private var bargeRec: Recognizer? = null
+    private var cmdRec: Recognizer? = null
+    private var freeRec: Recognizer? = null
     private var loadedPath: String? = null
+    private var vocabKey = 0
     private var loading = false
     private var thread: Thread? = null
     private var preferred: AudioDeviceInfo? = null
+    private var echoEffect: AcousticEchoCanceler? = null
+    private var noiseEffect: NoiseSuppressor? = null
+    private var lastPath: String? = null
+    private var lastHindi = false
+    private var lastVocab: Vocabulary = Vocabulary.EMPTY
 
+    // Used only by the capture thread
+    private val ring = ArrayDeque<ShortArray>()
+    private var sinceMark = 0
+    private var lastPartial = ""
+    private var bargeCooldownUntil = 0L
+    private var replayPending: List<ShortArray>? = null
+
+    @Volatile var requireWake: () -> Boolean = { true }
     @Volatile private var wantCapture = false
     @Volatile private var running = false
-    @Volatile private var muted = false
-    @Volatile private var needReset = false
+    @Volatile private var speaking = false
+    @Volatile private var speakingUntil = 0L
+    @Volatile private var windowUntil = 0L
 
     val isRunning: Boolean
         get() = running
 
-    fun start(path: String, preferredDevice: AudioDeviceInfo?) {
+    // ---------------- control (main thread) ----------------
+
+    fun start(path: String, isHindi: Boolean, vocab: Vocabulary, device: AudioDeviceInfo?) {
         wantCapture = true
-        preferred = preferredDevice
-        if (running && loadedPath == path) return
-        if (running) stopCapture()
-        wantCapture = true
-        synchronized(lock) {
-            if (loadedPath != null && loadedPath != path) freeModel()
-            if (model == null) {
-                if (!loading) {
-                    loading = true
-                    Thread({ load(path) }, "astra-vosk-load").start()
-                }
-                return
+        preferred = device
+        lastPath = path
+        lastHindi = isHindi
+        lastVocab = vocab
+        if (running) {
+            if (loadedPath == path && vocabKey == vocab.key()) return
+            stopCapture()
+            wantCapture = true
+        }
+        val ready = synchronized(lock) {
+            model != null && loadedPath == path && vocabKey == vocab.key() && freeRec != null
+        }
+        if (ready) {
+            main.post { if (wantCapture) beginCapture() }
+            return
+        }
+        val alreadyLoading = synchronized(lock) {
+            if (loading) {
+                true
+            } else {
+                loading = true
+                false
             }
         }
-        beginCapture()
+        if (alreadyLoading) return
+        Thread({ prepare(path, vocab) }, "astra-vosk-load").start()
     }
 
-    private fun load(path: String) {
+    fun setSpeaking(value: Boolean) {
+        if (value) {
+            speaking = true
+            speakingUntil = 0L
+        } else {
+            speaking = false
+            speakingUntil = SystemClock.elapsedRealtime() + TAIL_MS
+        }
+    }
+
+    // Lets the next speech through without the wake word, for example while waiting for yes or no.
+    fun openCommandWindow(ms: Long) {
+        windowUntil = SystemClock.elapsedRealtime() + ms
+    }
+
+    fun stopCapture() {
+        wantCapture = false
+        running = false
+        val t = thread
+        if (t != null && t.isAlive) {
+            try {
+                t.join(1500)
+            } catch (e: InterruptedException) {
+                Log.w(TAG, "interrupted while stopping", e)
+            }
+        }
+        if (t == null || !t.isAlive) thread = null
+    }
+
+    fun restartCapture(device: AudioDeviceInfo?) {
+        val path = lastPath ?: return
+        stopCapture()
+        start(path, lastHindi, lastVocab, device)
+    }
+
+    fun release() {
+        stopCapture()
+        synchronized(lock) {
+            closeRecognizers()
+            closeModel()
+        }
+    }
+
+    // ---------------- loading ----------------
+
+    private fun prepare(path: String, vocab: Vocabulary) {
         try {
             LibVosk.setLogLevel(LogLevel.WARNINGS)
-            val m = Model(path)
-            val r = Recognizer(m, SAMPLE_RATE.toFloat())
+            val existing = model
+            val m: Model = if (existing != null && loadedPath == path) {
+                existing
+            } else {
+                synchronized(lock) {
+                    closeRecognizers()
+                    closeModel()
+                }
+                Model(path)
+            }
+            val wake = grammarRecognizer(m, vocab.wake)
+            val barge = grammarRecognizer(m, vocab.stop)
+            val cmd = grammarRecognizer(m, vocab.command)
+            val free = Recognizer(m, SAMPLE_RATE.toFloat())
             synchronized(lock) {
+                closeRecognizers()
                 model = m
-                recognizer = r
                 loadedPath = path
+                vocabKey = vocab.key()
+                wakeRec = wake
+                bargeRec = barge
+                cmdRec = cmd
+                freeRec = free
                 loading = false
             }
             main.post { if (wantCapture) beginCapture() }
@@ -78,10 +254,49 @@ class OfflineRecognizer(
         }
     }
 
+    private fun grammarRecognizer(m: Model, words: List<String>): Recognizer? {
+        if (words.isEmpty()) return null
+        return try {
+            val json = JSONArray()
+            for (w in words) json.put(w)
+            json.put("[unk]")
+            Recognizer(m, SAMPLE_RATE.toFloat(), json.toString())
+        } catch (t: Throwable) {
+            Log.w(TAG, "Could not build a vocabulary recognizer", t)
+            null
+        }
+    }
+
+    private fun closeRecognizers() {
+        for (r in listOf(wakeRec, bargeRec, cmdRec, freeRec)) {
+            try {
+                r?.close()
+            } catch (e: Exception) {
+                Log.w(TAG, "recognizer.close failed", e)
+            }
+        }
+        wakeRec = null
+        bargeRec = null
+        cmdRec = null
+        freeRec = null
+    }
+
+    private fun closeModel() {
+        try {
+            model?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "model.close failed", e)
+        }
+        model = null
+        loadedPath = null
+    }
+
+    // ---------------- capture ----------------
+
     private fun beginCapture() {
         synchronized(lock) {
             if (running || thread?.isAlive == true) return
-            val rec = recognizer ?: return
+            if (freeRec == null) return
             val minBuf = AudioRecord.getMinBufferSize(
                 SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
             )
@@ -95,7 +310,7 @@ class OfflineRecognizer(
                     SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT,
-                    maxOf(minBuf * 2, 8192)
+                    maxOf(minBuf * 2, 16384)
                 )
             } catch (e: Exception) {
                 null
@@ -106,28 +321,74 @@ class OfflineRecognizer(
                 return
             }
             preferred?.let { record.setPreferredDevice(it) }
+            attachEffects(record.audioSessionId)
             try {
                 record.startRecording()
             } catch (e: Exception) {
+                releaseEffects()
                 record.release()
                 main.post { onFailure("The microphone could not start.") }
                 return
             }
             running = true
-            needReset = true
-            val t = Thread({ loop(rec, record) }, "astra-vosk-capture")
+            val t = Thread({ loop(record) }, "astra-vosk-capture")
             thread = t
             t.start()
         }
     }
 
-    private fun loop(rec: Recognizer, record: AudioRecord) {
-        val buffer = ShortArray(4000)
-        var lastPartial = ""
+    // Echo cancellation and noise suppression help the stop word work while ASTRA is talking.
+    private fun attachEffects(session: Int) {
+        try {
+            if (AcousticEchoCanceler.isAvailable()) {
+                echoEffect = AcousticEchoCanceler.create(session)
+                echoEffect?.enabled = true
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Echo canceller unavailable", e)
+        }
+        try {
+            if (NoiseSuppressor.isAvailable()) {
+                noiseEffect = NoiseSuppressor.create(session)
+                noiseEffect?.enabled = true
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Noise suppressor unavailable", e)
+        }
+    }
+
+    private fun releaseEffects() {
+        try {
+            echoEffect?.release()
+        } catch (e: Exception) {
+            Log.w(TAG, "echo release failed", e)
+        }
+        try {
+            noiseEffect?.release()
+        } catch (e: Exception) {
+            Log.w(TAG, "noise release failed", e)
+        }
+        echoEffect = null
+        noiseEffect = null
+    }
+
+    private fun currentMode(now: Long): Mode {
+        if (speaking || now < speakingUntil) return Mode.SPEAKING
+        if (!requireWake()) return Mode.COMMAND
+        return if (now < windowUntil) Mode.COMMAND else Mode.WAKE
+    }
+
+    private fun loop(record: AudioRecord) {
+        val buffer = ShortArray(CHUNK)
         var reported = false
+        var lastMode = Mode.WAKE
+        ring.clear()
+        sinceMark = 0
+        lastPartial = ""
+        replayPending = null
         try {
             while (running) {
-                val n = record.read(buffer, 0, buffer.size)
+                val n = record.read(buffer, 0, CHUNK)
                 if (n < 0) {
                     main.post { onFailure("The microphone stopped delivering audio.") }
                     break
@@ -141,21 +402,22 @@ class OfflineRecognizer(
                         onInput(label)
                     }
                 }
-                if (muted) continue
-                if (needReset) {
-                    needReset = false
-                    rec.reset()
-                    lastPartial = ""
+                val now = SystemClock.elapsedRealtime()
+                val chunk = buffer.copyOf(n)
+                val mode = currentMode(now)
+                if (mode != lastMode) {
+                    onModeChange(lastMode, mode)
+                    lastMode = mode
                 }
-                if (rec.acceptWaveForm(buffer, n)) {
-                    val text = jsonField(rec.result, "text")
-                    lastPartial = ""
-                    if (text.isNotBlank()) main.post { onFinal(text) }
-                } else {
-                    val partial = jsonField(rec.partialResult, "partial")
-                    if (partial != lastPartial) {
-                        lastPartial = partial
-                        if (partial.isNotBlank()) main.post { onPartial(partial) }
+                when (mode) {
+                    Mode.SPEAKING -> handleSpeaking(chunk, now)
+                    Mode.WAKE -> {
+                        remember(chunk)
+                        handleWake(chunk, now)
+                    }
+                    Mode.COMMAND -> {
+                        remember(chunk)
+                        handleCommand(chunk, now)
                     }
                 }
             }
@@ -168,12 +430,137 @@ class OfflineRecognizer(
             } catch (e: Exception) {
                 Log.w(TAG, "record.stop failed", e)
             }
+            releaseEffects()
             record.release()
             running = false
         }
     }
 
-    private fun jsonField(json: String, key: String): String =
+    private fun remember(chunk: ShortArray) {
+        ring.addLast(chunk)
+        while (ring.size > RING_CHUNKS) ring.removeFirst()
+        sinceMark++
+    }
+
+    private fun onModeChange(from: Mode, to: Mode) {
+        when {
+            to == Mode.SPEAKING -> {
+                bargeRec?.reset()
+                lastPartial = ""
+            }
+            from == Mode.SPEAKING -> {
+                // ASTRA just finished talking. Throw away anything that might be its own voice.
+                wakeRec?.reset()
+                cmdRec?.reset()
+                freeRec?.reset()
+                ring.clear()
+                sinceMark = 0
+                lastPartial = ""
+                replayPending = null
+            }
+            to == Mode.WAKE -> {
+                wakeRec?.reset()
+                cmdRec?.reset()
+                freeRec?.reset()
+                windowUntil = 0L
+                lastPartial = ""
+                if (from == Mode.COMMAND && requireWake()) main.post { onWindowClosed() }
+            }
+            to == Mode.COMMAND -> {
+                cmdRec?.reset()
+                freeRec?.reset()
+                lastPartial = ""
+                val replay = replayPending
+                replayPending = null
+                if (replay != null) {
+                    for (c in replay) handleCommand(c, SystemClock.elapsedRealtime())
+                }
+            }
+        }
+    }
+
+    // ---------------- wake mode ----------------
+
+    private fun handleWake(chunk: ShortArray, now: Long) {
+        val rec = wakeRec ?: freeRec ?: return
+        val end = rec.acceptWaveForm(chunk, chunk.size)
+        if (end) {
+            val text = clean(field(rec.result, "text"))
+            if (WakeVariants.isWakeFinal(text)) triggerWake(now) else sinceMark = 0
+            rec.reset()
+        } else {
+            val partial = clean(field(rec.partialResult, "partial"))
+            if (partial.isNotEmpty() && WakeVariants.isWakePartial(partial)) {
+                triggerWake(now)
+                rec.reset()
+            }
+        }
+    }
+
+    private fun triggerWake(now: Long) {
+        val count = minOf(sinceMark + 2, ring.size)
+        replayPending = ring.toList().takeLast(count)
+        windowUntil = now + FIRST_COMMAND_MS
+        sinceMark = 0
+        main.post { onWake() }
+    }
+
+    // ---------------- command mode ----------------
+
+    private fun handleCommand(chunk: ShortArray, now: Long) {
+        val free = freeRec ?: return
+        val cmd = cmdRec
+        val gEnd = cmd?.acceptWaveForm(chunk, chunk.size) ?: false
+        val fEnd = free.acceptWaveForm(chunk, chunk.size)
+        if (!gEnd && !fEnd) {
+            val partial = clean(field(free.partialResult, "partial"))
+            if (partial.isNotEmpty() && partial != lastPartial) {
+                lastPartial = partial
+                if (windowUntil != 0L) windowUntil = maxOf(windowUntil, now + EXTEND_MS)
+                val shown = WakeVariants.stripLeading(partial)
+                main.post { onPartial(shown) }
+            }
+            return
+        }
+        val g = if (cmd == null) "" else clean(field(if (gEnd) cmd.result else cmd.finalResult, "text"))
+        val f = clean(field(if (fEnd) free.result else free.finalResult, "text"))
+        cmd?.reset()
+        free.reset()
+        lastPartial = ""
+        val command = WakeVariants.stripLeading(choose(g, f))
+        if (command.isBlank()) return
+        if (requireWake()) windowUntil = 0L
+        main.post { onFinal(command) }
+    }
+
+    // Trust the command-vocabulary result when it understood every word, otherwise use the open result.
+    private fun choose(grammarText: String, freeText: String): String {
+        val tokens = grammarText.split(" ").filter { it.isNotBlank() }.toMutableList()
+        while (tokens.isNotEmpty() && tokens.first() == UNK) tokens.removeAt(0)
+        while (tokens.isNotEmpty() && tokens.last() == UNK) tokens.removeAt(tokens.size - 1)
+        return if (tokens.isNotEmpty() && tokens.none { it == UNK }) tokens.joinToString(" ") else freeText
+    }
+
+    // ---------------- speaking mode ----------------
+
+    private fun handleSpeaking(chunk: ShortArray, now: Long) {
+        val rec = bargeRec ?: return
+        val end = rec.acceptWaveForm(chunk, chunk.size)
+        val text = clean(field(if (end) rec.result else rec.partialResult, if (end) "text" else "partial"))
+        if (end) rec.reset()
+        if (now < bargeCooldownUntil) return
+        if (text.isNotEmpty() && StopPhrases.matches(text)) {
+            rec.reset()
+            bargeCooldownUntil = now + 1500L
+            main.post { onBargeIn() }
+        }
+    }
+
+    // ---------------- helpers ----------------
+
+    private fun clean(text: String): String = text.trim().replace(Regex("\\s+"), " ")
+
+    private fun field(json: String, key: String): String =
         try {
             JSONObject(json).optString(key, "").trim()
         } catch (e: Exception) {
@@ -195,56 +582,14 @@ class OfflineRecognizer(
         }
     }
 
-    // While muted the microphone stays on, but the audio is thrown away (used while ASTRA speaks).
-    fun setMuted(value: Boolean) {
-        muted = value
-        if (!value) needReset = true
-    }
-
-    // Releases the microphone but keeps the speech model loaded for a quick restart.
-    fun stopCapture() {
-        wantCapture = false
-        running = false
-        val t = thread
-        if (t != null && t.isAlive) {
-            try {
-                t.join(1500)
-            } catch (e: InterruptedException) {
-                Log.w(TAG, "interrupted while stopping", e)
-            }
-        }
-        if (t == null || !t.isAlive) thread = null
-    }
-
-    fun restartCapture(preferredDevice: AudioDeviceInfo?) {
-        val path = loadedPath ?: return
-        stopCapture()
-        start(path, preferredDevice)
-    }
-
-    fun release() {
-        stopCapture()
-        synchronized(lock) { freeModel() }
-    }
-
-    private fun freeModel() {
-        try {
-            recognizer?.close()
-        } catch (e: Exception) {
-            Log.w(TAG, "recognizer.close failed", e)
-        }
-        try {
-            model?.close()
-        } catch (e: Exception) {
-            Log.w(TAG, "model.close failed", e)
-        }
-        recognizer = null
-        model = null
-        loadedPath = null
-    }
-
     companion object {
         private const val TAG = "ASTRA_OFFLINE"
+        private const val UNK = "[unk]"
         private const val SAMPLE_RATE = 16000
+        private const val CHUNK = 1600
+        private const val RING_CHUNKS = 50
+        private const val FIRST_COMMAND_MS = 9000L
+        private const val EXTEND_MS = 4000L
+        private const val TAIL_MS = 500L
     }
 }
