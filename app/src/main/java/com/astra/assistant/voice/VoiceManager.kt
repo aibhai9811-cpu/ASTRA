@@ -27,7 +27,10 @@ class VoiceManager(
     private val onError: (String) -> Unit = {},
     private val onListeningStarted: () -> Unit = {},
     private val onAvailabilityChanged: (Boolean) -> Unit = {},
-    private val onInputDeviceChanged: (String) -> Unit = {}
+    private val onInputDeviceChanged: (String) -> Unit = {},
+    private val onWakeHeard: () -> Unit = {},
+    private val onCommandWindowClosed: () -> Unit = {},
+    private val onBargeIn: () -> Unit = {}
 ) {
     // Aliases. Inside the RecognitionListener object, a call like onRmsChanged(x)
     // would call the listener's own method (endless loop = crash), so we use these.
@@ -36,6 +39,9 @@ class VoiceManager(
     private val rmsCallback: (Float) -> Unit = onRmsChanged
     private val endOfSpeechCallback: () -> Unit = onEndOfSpeech
     private val errorCallback: (String) -> Unit = onError
+    private val wakeCallback: () -> Unit = onWakeHeard
+    private val windowClosedCallback: () -> Unit = onCommandWindowClosed
+    private val bargeCallback: () -> Unit = onBargeIn
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var recognizer: SpeechRecognizer? = null
@@ -64,6 +70,13 @@ class VoiceManager(
     // Folder of a downloaded offline model. When set, the offline engine is used.
     var offlineModelPath: String? = null
 
+    // Vocabulary used by the offline engine for the wake word, stop words and commands.
+    var vocabulary: OfflineRecognizer.Vocabulary = OfflineRecognizer.Vocabulary.EMPTY
+    var hindiModel: Boolean = false
+
+    // true when the wake word is needed to start a command (ASTRA is not on screen)
+    var requireWakeProvider: () -> Boolean = { true }
+
     // The earbud input to ask for (offline engine only). null means the default microphone.
     var preferredInput: AudioDeviceInfo? = null
 
@@ -79,11 +92,15 @@ class VoiceManager(
     var speechRate: Float = 1.0f
     var speechPitch: Float = 0.95f
 
-    // When true the microphone stays on while ASTRA talks, so a stop phrase can interrupt it.
+    // Google engine only. The offline engine always keeps listening for a stop word while ASTRA talks.
     var allowBargeIn: Boolean = true
 
     val isSpeaking: Boolean
         get() = isSpeakingNow
+
+    // true when the offline engine decides about the wake word itself
+    val engineHandlesWake: Boolean
+        get() = offlineModelPath != null
 
     var continuousMode: Boolean
         get() = desired
@@ -201,9 +218,13 @@ class VoiceManager(
             onFinal = { text -> deliverFinal(text) },
             onFailure = { message -> handleOfflineFailure(message) },
             onInput = { label -> onInputDeviceChanged(label) },
-            onCaptureStarted = { setAvailable(true) }
+            onCaptureStarted = { setAvailable(true) },
+            onWake = { wakeCallback() },
+            onWindowClosed = { windowClosedCallback() },
+            onBargeIn = { bargeCallback() }
         ).also { offline = it }
-        engine.start(path, preferredInput)
+        engine.requireWake = requireWakeProvider
+        engine.start(path, hindiModel, vocabulary, preferredInput)
     }
 
     private fun handleOfflineFailure(message: String) {
@@ -213,6 +234,11 @@ class VoiceManager(
         offlineModelPath = null
         notifyOnce("$message Switching to Google speech recognition.")
         if (desired && !suspended) scheduleBegin(300)
+    }
+
+    // Lets the next speech through without the wake word (for example while waiting for yes or no).
+    fun openCommandWindow(ms: Long) {
+        offline?.openCommandWindow(ms)
     }
 
     // ---------------- Google engine ----------------
@@ -443,11 +469,9 @@ class VoiceManager(
     private fun finishSpeaking() {
         mainHandler.post {
             isSpeakingNow = false
+            offline?.setSpeaking(false)
             onStateChange(false)
-            if (!allowBargeIn) {
-                if (offlineModelPath == null) scheduleBegin(400)
-                mainHandler.postDelayed({ offline?.setMuted(false) }, 500)
-            }
+            if (!allowBargeIn && offlineModelPath == null) scheduleBegin(400)
         }
     }
 
@@ -457,10 +481,10 @@ class VoiceManager(
             return
         }
         isSpeakingNow = true
-        if (!allowBargeIn) {
+        offline?.setSpeaking(true)
+        if (offlineModelPath == null && !allowBargeIn) {
             mainHandler.removeCallbacks(beginRunnable)
             cancelSession()
-            offline?.setMuted(true)
         }
         val hasDevanagari = text.any { it in '\u0900'..'\u097F' }
         textToSpeech?.language = if (hasDevanagari) Locale("hi", "IN") else Locale("en", "IN")
@@ -473,11 +497,9 @@ class VoiceManager(
     fun stopSpeaking() {
         textToSpeech?.stop()
         isSpeakingNow = false
+        offline?.setSpeaking(false)
         onStateChange(false)
-        if (!allowBargeIn) {
-            if (offlineModelPath == null) scheduleBegin(300)
-            mainHandler.postDelayed({ offline?.setMuted(false) }, 300)
-        }
+        if (!allowBargeIn && offlineModelPath == null) scheduleBegin(300)
     }
 
     fun shutdown() {
