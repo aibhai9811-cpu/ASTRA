@@ -15,6 +15,8 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.util.Log
 import com.astra.assistant.MainActivity
 import com.astra.assistant.ai.AiOutcome
@@ -23,6 +25,8 @@ import com.astra.assistant.audio.AudioRouteManager
 import com.astra.assistant.audio.CallStateMonitor
 import com.astra.assistant.commands.CommandExecutionResult
 import com.astra.assistant.commands.CommandProcessor
+import com.astra.assistant.commands.CommandVocabulary
+import com.astra.assistant.commands.VoiceCommandRouter
 import com.astra.assistant.data.AstraDatabase
 import com.astra.assistant.data.repository.AstraMemoryRepository
 import com.astra.assistant.model.AssistantState
@@ -43,6 +47,7 @@ class ListenService : Service() {
 
     private var voice: VoiceManager? = null
     private var processor: CommandProcessor? = null
+    private var router: VoiceCommandRouter? = null
     private var memoryRepository: AstraMemoryRepository? = null
     private var audioRoute: AudioRouteManager? = null
     private var callMonitor: CallStateMonitor? = null
@@ -54,6 +59,7 @@ class ListenService : Service() {
     private var speechEndedAt = 0L
     private var callPaused = false
     private var recognitionUnavailable = false
+    private var commandMode = false
     private var endAfterReply = false
     private var lastStatusText = ""
     private var inputLabel = ""
@@ -174,10 +180,11 @@ class ListenService : Service() {
         }
         AssistantBridge.micStatus.value = status
         AssistantBridge.inputDevice.value = inputText()
-        val text = when (status) {
-            MicStatus.PAUSED_FOR_CALL -> "Paused for a phone call. I will resume afterwards."
-            MicStatus.UNAVAILABLE -> "Speech recognition is unavailable. Retrying..."
-            else -> "Listening (${engineLabel()}). ${inputText()}. Say ASTRA and a command."
+        val text = when {
+            status == MicStatus.PAUSED_FOR_CALL -> "Paused for a phone call. I will resume afterwards."
+            status == MicStatus.UNAVAILABLE -> "Speech recognition is unavailable. Retrying..."
+            commandMode -> "Listening for your command..."
+            else -> "Say ASTRA, then your command. (${engineLabel()}, ${inputText()})"
         }
         if (text != lastStatusText) {
             lastStatusText = text
@@ -185,10 +192,21 @@ class ListenService : Service() {
         }
     }
 
+    @Suppress("DEPRECATION")
+    private fun vibrateShort() {
+        try {
+            val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator ?: return
+            vibrator.vibrate(VibrationEffect.createOneShot(40, VibrationEffect.DEFAULT_AMPLITUDE))
+        } catch (e: Exception) {
+            Log.w(TAG, "Vibration not available", e)
+        }
+    }
+
     // ---------------- setup and lifecycle ----------------
 
     private fun setUp() {
         processor = CommandProcessor(applicationContext)
+        router = VoiceCommandRouter(applicationContext)
         memoryRepository = AstraMemoryRepository(AstraDatabase.getDatabase(applicationContext, scope).memoryDao())
         val power = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "astra:listen").apply {
@@ -208,8 +226,12 @@ class ListenService : Service() {
             onInputDeviceChanged = { label ->
                 inputLabel = label
                 updateStatus()
-            }
+            },
+            onWakeHeard = { onWakeHeard() },
+            onCommandWindowClosed = { onWindowClosed() },
+            onBargeIn = { hush() }
         )
+        voice?.requireWakeProvider = { !AssistantBridge.appVisible }
         audioRoute = AudioRouteManager(applicationContext) { onAudioDevicesChanged() }
         audioRoute?.start()
         callMonitor = CallStateMonitor(applicationContext) { inCall -> onCallChanged(inCall) }
@@ -230,6 +252,7 @@ class ListenService : Service() {
     // initial = true is used when the microphone is switched ON. Only then can the engine change.
     private fun applySettings(initial: Boolean) {
         val engine = voice ?: return
+        val hindi = VoiceSettings.language(this) == VoiceSettings.LANG_HI
         engine.recognitionLanguage = when (VoiceSettings.language(this)) {
             VoiceSettings.LANG_HI -> "hi-IN"
             VoiceSettings.LANG_EN -> "en-IN"
@@ -239,6 +262,8 @@ class ListenService : Service() {
         engine.allowBargeIn = currentRoute.usingBluetooth
         engine.preferredInput = if (currentRoute.usingBluetooth) bluetoothInputDevice() else null
         if (initial) {
+            engine.hindiModel = hindi
+            engine.vocabulary = CommandVocabulary.build(applicationContext, hindi)
             val model = VoskModels.forLanguage(VoiceSettings.language(this))
             engine.offlineModelPath =
                 if (VoiceSettings.useOffline(this) && VoskModels.isInstalled(this, model)) {
@@ -284,10 +309,23 @@ class ListenService : Service() {
         updateStatus()
     }
 
+    private fun onWakeHeard() {
+        commandMode = true
+        vibrateShort()
+        AssistantBridge.partial.value = "Listening for your command..."
+        updateStatus()
+    }
+
+    private fun onWindowClosed() {
+        commandMode = false
+        AssistantBridge.partial.value = ""
+        updateStatus()
+    }
+
     private fun onPartial(text: String) {
         if (voice?.isSpeaking == true) {
             if (isHushPhrase(text)) hush()
-        } else {
+        } else if (text.isNotBlank()) {
             AssistantBridge.partial.value = text
         }
     }
@@ -336,14 +374,13 @@ class ListenService : Service() {
         AssistantBridge.phase.value = AssistantState.LISTENING
     }
 
-    // ASTRA's own voice can be picked up by the microphone. Ignore what it just said.
+    // The Google engine can pick up ASTRA's own voice. Ignore a long repeat of what it just said.
     private fun looksLikeEcho(text: String): Boolean {
         val spoken = lastSpoken ?: return false
         val now = SystemClock.elapsedRealtime()
-        if (now - speechEndedAt < 1200) return true
         if (now - speechEndedAt > 8000) return false
         val words = normalize(text).split(" ").filter { it.isNotEmpty() }
-        if (words.size < 2) return false
+        if (words.size < 3) return false
         val spokenWords = normalize(spoken).split(" ").toSet()
         return words.count { it in spokenWords } >= words.size * 0.8
     }
@@ -355,13 +392,19 @@ class ListenService : Service() {
         if (text.isEmpty() || callPaused) return
         applySettings(false)
         val now = SystemClock.elapsedRealtime()
+        val engineDecidesWake = voice?.engineHandlesWake == true
 
-        // 0. While ASTRA talks only a stop phrase is accepted. Anything else is probably its own voice.
+        // 0. While ASTRA talks only a stop phrase is accepted.
         if (voice?.isSpeaking == true) {
             if (isHushPhrase(text)) hush()
             return
         }
         if (looksLikeEcho(text)) return
+
+        if (commandMode) {
+            commandMode = false
+            updateStatus()
+        }
 
         val stripped = WakeWord.strip(text)
 
@@ -395,16 +438,17 @@ class ListenService : Service() {
         // 2. A stop phrase with nothing to stop is ignored. It is never sent to Gemini or the command engine.
         if (isHushPhrase(text)) return
 
-        // 3. The wake word is required when ASTRA is not on screen.
+        // 3. The offline engine already handled the wake word. The Google engine needs it checked here.
         var command = text
-        if (!AssistantBridge.appVisible) {
+        if (engineDecidesWake) {
+            if (!stripped.isNullOrEmpty()) command = stripped
+        } else if (!AssistantBridge.appVisible) {
             if (stripped == null) {
                 if (now > followUpUntil) return
             } else {
                 command = stripped
                 if (command.isEmpty()) {
                     followUpUntil = now + FOLLOW_UP_MS
-                    reply(text, "Yes, sir?")
                     return
                 }
             }
@@ -469,7 +513,13 @@ class ListenService : Service() {
         AssistantBridge.phase.value = AssistantState.PROCESSING
         scope.launch {
             try {
-                val result = processor?.processCommand(command)
+                val engine = processor
+                val smart = router
+                val result: CommandExecutionResult? = when {
+                    engine == null -> null
+                    smart != null -> smart.route(engine, command)
+                    else -> engine.processCommand(command)
+                }
                 if (result is CommandExecutionResult.RouteToAi) {
                     askAi(command, result.query)
                 } else {
@@ -506,8 +556,9 @@ class ListenService : Service() {
             }
             is CommandExecutionResult.RequiresConfirmation -> {
                 ConfirmationManager.set(result.pendingAction)
+                voice?.openCommandWindow(CONFIRM_WINDOW_MS)
                 reply(userText, result.pendingAction.prompt + " Say yes or no.")
-         }
+            }
             is CommandExecutionResult.Error -> reply(userText, result.error)
             is CommandExecutionResult.RouteToAi -> reply(userText, "Done.")
             null -> reply(userText, "ASTRA is not ready yet.")
@@ -521,10 +572,12 @@ class ListenService : Service() {
         when (outcome) {
             is AiOutcome.Reply -> {
                 followUpUntil = SystemClock.elapsedRealtime() + FOLLOW_UP_MS
+                voice?.openCommandWindow(FOLLOW_UP_MS)
                 val suggestion = outcome.suggestedCommand
                 if (suggestion != null) {
                     val label = outcome.actionLabel ?: suggestion
                     ConfirmationManager.set(PendingAction("AI_COMMAND", suggestion, "Run: $label?", label))
+                    voice?.openCommandWindow(CONFIRM_WINDOW_MS)
                     reply(spoken, "${outcome.text} Should I run: $label? Say yes or no.")
                 } else {
                     reply(spoken, outcome.text)
@@ -579,6 +632,7 @@ class ListenService : Service() {
         private const val ACTION_STOP = "com.astra.assistant.STOP_LISTENING"
         private const val ACTION_HUSH = "com.astra.assistant.HUSH"
         private const val FOLLOW_UP_MS = 25000L
+        private const val CONFIRM_WINDOW_MS = 30000L
 
         private val NOISE = Regex("[^\\p{L}\\p{M}\\p{N} ]")
         private val SPACES = Regex("\\s+")
@@ -619,3 +673,4 @@ class ListenService : Service() {
         }
     }
 }
+     
