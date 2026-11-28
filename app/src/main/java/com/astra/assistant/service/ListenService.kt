@@ -26,6 +26,7 @@ import com.astra.assistant.audio.CallStateMonitor
 import com.astra.assistant.commands.CommandExecutionResult
 import com.astra.assistant.commands.CommandProcessor
 import com.astra.assistant.commands.CommandVocabulary
+import com.astra.assistant.commands.ContactPicker
 import com.astra.assistant.commands.VoiceCommandRouter
 import com.astra.assistant.data.AstraDatabase
 import com.astra.assistant.data.repository.AstraMemoryRepository
@@ -44,6 +45,15 @@ import kotlinx.coroutines.launch
 import java.util.Locale
 
 class ListenService : Service() {
+
+    private class PendingDictation(val name: String, val viaWhatsApp: Boolean, val createdAt: Long)
+
+    private class PendingPick(
+        val original: String,
+        val needle: String,
+        val options: List<String>,
+        val createdAt: Long
+    )
 
     private var voice: VoiceManager? = null
     private var processor: CommandProcessor? = null
@@ -64,6 +74,8 @@ class ListenService : Service() {
     private var lastStatusText = ""
     private var inputLabel = ""
     private var currentRoute = AudioRouteManager.Route(false, "Phone microphone")
+    private var dictation: PendingDictation? = null
+    private var pick: PendingPick? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -347,8 +359,8 @@ class ListenService : Service() {
     }
 
     private fun finishSingleShot() {
-        // Keep listening if ASTRA is waiting for a yes or no.
-        if (ConfirmationManager.peek() != null) {
+        // Keep listening if ASTRA is waiting for an answer.
+        if (ConfirmationManager.peek() != null || pick != null || dictation != null) {
             endAfterReply = false
             return
         }
@@ -368,6 +380,8 @@ class ListenService : Service() {
         if (n in HUSH_PHRASES) return true
         return n.split(" ").size <= 5 && HUSH_CONTAINS.any { n.contains(it) }
     }
+
+    private fun isCancelWord(raw: String): Boolean = normalize(raw) in CANCEL_WORDS
 
     private fun hush() {
         voice?.stopSpeaking()
@@ -432,6 +446,43 @@ class ListenService : Service() {
                         return
                     }
                 }
+            }
+        }
+
+        // 1b. Answers to ASTRA's own questions: which contact, and what a message should say.
+        val choosing = pick
+        if (choosing != null) {
+            pick = null
+            if (now - choosing.createdAt <= ASK_TIMEOUT_MS) {
+                if (isCancelWord(text)) {
+                    reply(text, "Cancelled.")
+                    return
+                }
+                val chosen = ContactPicker.choose(choosing.options, choosing.needle, text)
+                if (chosen == null) {
+                    reply(text, "I did not catch which one, so I cancelled.")
+                    return
+                }
+                runCommand(ContactPicker.replaceName(choosing.original, choosing.needle, chosen))
+                return
+            }
+        }
+        val dictating = dictation
+        if (dictating != null) {
+            dictation = null
+            if (now - dictating.createdAt <= ASK_TIMEOUT_MS) {
+                if (isCancelWord(text)) {
+                    reply(text, "Cancelled.")
+                    return
+                }
+                val body = text.trim()
+                val command = if (dictating.viaWhatsApp) {
+                    "send a whatsapp message to ${dictating.name} saying $body"
+                } else {
+                    "send a text message to ${dictating.name} saying $body"
+                }
+                runCommand(command)
+                return
             }
         }
 
@@ -509,7 +560,22 @@ class ListenService : Service() {
         }
     }
 
+    private fun askWhichContact(command: String, ambiguity: ContactPicker.Ambiguity) {
+        pick = PendingPick(command, ambiguity.needle, ambiguity.options, SystemClock.elapsedRealtime())
+        voice?.openCommandWindow(ASK_WINDOW_MS)
+        reply(
+            command,
+            "I found ${ambiguity.options.size} contacts named ${ambiguity.needle}: " +
+                "${ambiguity.options.joinToString(", ")}. Say the name or the number."
+        )
+    }
+
     private fun runCommand(command: String) {
+        val ambiguity = ContactPicker.find(applicationContext, command)
+        if (ambiguity != null) {
+            askWhichContact(command, ambiguity)
+            return
+        }
         AssistantBridge.phase.value = AssistantState.PROCESSING
         scope.launch {
             try {
@@ -559,7 +625,20 @@ class ListenService : Service() {
                 voice?.openCommandWindow(CONFIRM_WINDOW_MS)
                 reply(userText, result.pendingAction.prompt + " Say yes or no.")
             }
-            is CommandExecutionResult.Error -> reply(userText, result.error)
+            is CommandExecutionResult.Error -> {
+                val ask = ASK_FOR_BODY.matchEntire(result.error)
+                if (ask != null) {
+                    dictation = PendingDictation(
+                        ask.groupValues[1],
+                        WHATSAPP.containsMatchIn(userText),
+                        SystemClock.elapsedRealtime()
+                    )
+                    voice?.openCommandWindow(ASK_WINDOW_MS)
+                    reply(userText, "What should the message say?")
+                } else {
+                    reply(userText, result.error)
+                }
+            }
             is CommandExecutionResult.RouteToAi -> reply(userText, "Done.")
             null -> reply(userText, "ASTRA is not ready yet.")
         }
@@ -618,6 +697,8 @@ class ListenService : Service() {
         scope.cancel()
         wakeLock?.let { if (it.isHeld) it.release() }
         ConfirmationManager.clear()
+        pick = null
+        dictation = null
         AssistantBridge.active.value = false
         AssistantBridge.phase.value = AssistantState.IDLE
         AssistantBridge.partial.value = ""
@@ -633,10 +714,18 @@ class ListenService : Service() {
         private const val ACTION_HUSH = "com.astra.assistant.HUSH"
         private const val FOLLOW_UP_MS = 25000L
         private const val CONFIRM_WINDOW_MS = 30000L
+        private const val ASK_WINDOW_MS = 25000L
+        private const val ASK_TIMEOUT_MS = 30000L
 
         private val NOISE = Regex("[^\\p{L}\\p{M}\\p{N} ]")
         private val SPACES = Regex("\\s+")
+        private val WHATSAPP = Regex("whats\\s?app", RegexOption.IGNORE_CASE)
+        private val ASK_FOR_BODY = Regex("^What should the message to (.+) say\\?$")
 
+        private val CANCEL_WORDS = setOf(
+            "cancel", "never mind", "nevermind", "stop", "no", "nahi", "nahin", "rehne do", "rahne do",
+            "रहने दो", "नहीं"
+        )
         private val HUSH_PHRASES = setOf(
             "stop", "quiet", "quite", "silence", "enough", "shut up", "be quiet", "stop speaking",
             "stop talking", "stop voice", "cancel speech", "chup", "chup ho jao", "chup raho",
@@ -673,4 +762,3 @@ class ListenService : Service() {
         }
     }
 }
-     
