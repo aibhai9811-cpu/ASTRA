@@ -85,7 +85,8 @@ object StopPhrases {
 
 // Offline speech recognition with one microphone session and three modes:
 // WAKE (waiting for "ASTRA"), COMMAND (capturing a command) and SPEAKING (only listening for "stop").
-// All callbacks arrive on the main thread.
+// In COMMAND mode the pieces of one sentence are collected, and the sentence is delivered only after
+// a pause long enough to mean "I am done". All callbacks arrive on the main thread.
 class OfflineRecognizer(
     private val onPartial: (String) -> Unit,
     private val onFinal: (String) -> Unit,
@@ -130,6 +131,9 @@ class OfflineRecognizer(
     private var lastPartial = ""
     private var bargeCooldownUntil = 0L
     private var replayPending: List<ShortArray>? = null
+    private val assembled = StringBuilder()
+    private var lastSpeechAt = 0L
+    private var assemblyStartedAt = 0L
 
     @Volatile var requireWake: () -> Boolean = { true }
     @Volatile private var wantCapture = false
@@ -375,6 +379,8 @@ class OfflineRecognizer(
     private fun currentMode(now: Long): Mode {
         if (speaking || now < speakingUntil) return Mode.SPEAKING
         if (!requireWake()) return Mode.COMMAND
+        // Never drop out of command mode while a sentence is still being collected.
+        if (assembled.isNotEmpty()) return Mode.COMMAND
         return if (now < windowUntil) Mode.COMMAND else Mode.WAKE
     }
 
@@ -386,6 +392,7 @@ class OfflineRecognizer(
         sinceMark = 0
         lastPartial = ""
         replayPending = null
+        assembled.setLength(0)
         try {
             while (running) {
                 val n = record.read(buffer, 0, CHUNK)
@@ -447,6 +454,7 @@ class OfflineRecognizer(
             to == Mode.SPEAKING -> {
                 bargeRec?.reset()
                 lastPartial = ""
+                assembled.setLength(0)
             }
             from == Mode.SPEAKING -> {
                 // ASTRA just finished talking. Throw away anything that might be its own voice.
@@ -457,6 +465,7 @@ class OfflineRecognizer(
                 sinceMark = 0
                 lastPartial = ""
                 replayPending = null
+                assembled.setLength(0)
             }
             to == Mode.WAKE -> {
                 wakeRec?.reset()
@@ -464,12 +473,17 @@ class OfflineRecognizer(
                 freeRec?.reset()
                 windowUntil = 0L
                 lastPartial = ""
+                assembled.setLength(0)
                 if (from == Mode.COMMAND && requireWake()) main.post { onWindowClosed() }
             }
             to == Mode.COMMAND -> {
                 cmdRec?.reset()
                 freeRec?.reset()
                 lastPartial = ""
+                assembled.setLength(0)
+                val now = SystemClock.elapsedRealtime()
+                lastSpeechAt = now
+                assemblyStartedAt = now
                 val replay = replayPending
                 replayPending = null
                 if (replay != null) {
@@ -512,25 +526,58 @@ class OfflineRecognizer(
         val cmd = cmdRec
         val gEnd = cmd?.acceptWaveForm(chunk, chunk.size) ?: false
         val fEnd = free.acceptWaveForm(chunk, chunk.size)
-        if (!gEnd && !fEnd) {
+        if (gEnd || fEnd) {
+            val g = if (cmd == null) "" else clean(field(if (gEnd) cmd.result else cmd.finalResult, "text"))
+            val f = clean(field(if (fEnd) free.result else free.finalResult, "text"))
+            cmd?.reset()
+            free.reset()
+            lastPartial = ""
+            val piece = choose(g, f)
+            if (piece.isNotBlank()) {
+                if (assembled.isEmpty()) assemblyStartedAt = now else assembled.append(' ')
+                assembled.append(piece)
+                lastSpeechAt = now
+                if (windowUntil != 0L) windowUntil = maxOf(windowUntil, now + WINDOW_EXTEND_MS)
+            }
+        } else {
             val partial = clean(field(free.partialResult, "partial"))
             if (partial.isNotEmpty() && partial != lastPartial) {
                 lastPartial = partial
-                if (windowUntil != 0L) windowUntil = maxOf(windowUntil, now + EXTEND_MS)
-                val shown = WakeVariants.stripLeading(partial)
+                lastSpeechAt = now
+                if (windowUntil != 0L) windowUntil = maxOf(windowUntil, now + WINDOW_EXTEND_MS)
+                val shown = WakeVariants.stripLeading((assembled.toString() + " " + partial).trim())
                 main.post { onPartial(shown) }
             }
-            return
         }
-        val g = if (cmd == null) "" else clean(field(if (gEnd) cmd.result else cmd.finalResult, "text"))
-        val f = clean(field(if (fEnd) free.result else free.finalResult, "text"))
-        cmd?.reset()
-        free.reset()
+        flushIfQuiet(now)
+    }
+
+    // Delivers the collected sentence once there has been enough quiet to mean "I am done".
+    private fun flushIfQuiet(now: Long) {
+        if (assembled.isEmpty()) return
+        val text = assembled.toString().trim()
+        val head = WakeVariants.stripLeading(text)
+        val quiet = now - lastSpeechAt
+        val tooLong = now - assemblyStartedAt > MAX_SENTENCE_MS
+        if (quiet < gapFor(head) && !tooLong) return
+        assembled.setLength(0)
         lastPartial = ""
-        val command = WakeVariants.stripLeading(choose(g, f))
-        if (command.isBlank()) return
         if (requireWake()) windowUntil = 0L
-        main.post { onFinal(command) }
+        if (head.isNotBlank()) main.post { onFinal(head) }
+    }
+
+    // How long a pause must last before the sentence counts as finished.
+    private fun gapFor(text: String): Long {
+        val words = text.split(" ").filter { it.isNotBlank() }
+        if (words.isEmpty()) return 900L
+        var gap = when {
+            words[0] in MESSAGE_VERBS -> 2000L
+            words[0] in CALL_VERBS -> 1500L
+            words.size <= 3 -> 600L
+            else -> 900L
+        }
+        if (words.last() in CONNECTORS) gap += 1000L
+        return gap
     }
 
     // Trust the command-vocabulary result when it understood every word, otherwise use the open result.
@@ -589,7 +636,19 @@ class OfflineRecognizer(
         private const val CHUNK = 1600
         private const val RING_CHUNKS = 50
         private const val FIRST_COMMAND_MS = 9000L
-        private const val EXTEND_MS = 4000L
+        private const val WINDOW_EXTEND_MS = 6000L
+        private const val MAX_SENTENCE_MS = 20000L
         private const val TAIL_MS = 500L
+
+        private val MESSAGE_VERBS = setOf(
+            "send", "text", "message", "msg", "whatsapp", "say", "write", "tell", "remind", "note",
+            "remember", "search", "google", "ask", "email"
+        )
+        private val CALL_VERBS = setOf("call", "dial", "phone", "ring", "set", "wake")
+        private val CONNECTORS = setOf(
+            "and", "to", "on", "the", "a", "an", "for", "with", "that", "saying", "say", "at", "in", "of",
+            "my", "me", "is", "i", "will", "be", "am", "are", "it", "this", "about", "please"
+        )
     }
 }
+        
